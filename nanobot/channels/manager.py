@@ -43,6 +43,7 @@ class ChannelManager:
                     self.bus,
                     groq_api_key=self.config.providers.groq.api_key,
                     candidate_models=self.config.agents.defaults.candidate_models,
+                    default_model=self.config.agents.defaults.model,
                 )
                 logger.info("Telegram channel enabled")
             except ImportError as e:

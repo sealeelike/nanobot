@@ -171,17 +171,20 @@ class TelegramChannel(BaseChannel):
         bus: MessageBus,
         groq_api_key: str = "",
         candidate_models: list[str] | None = None,
+        default_model: str = "",
     ):
         super().__init__(config, bus)
         self.config: TelegramConfig = config
         self.groq_api_key = groq_api_key
         self.candidate_models: list[str] = list(candidate_models or [])
+        self.default_model: str = default_model
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
         self._media_group_buffers: dict[str, dict] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
         self._message_threads: dict[tuple[str, int], int] = {}
+        self._session_current_model: dict[str, str] = {}  # session key → active model
 
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
@@ -473,6 +476,9 @@ class TelegramChannel(BaseChannel):
         args = context.args or []
         if args:
             model_name = " ".join(args)
+            # Record the switch locally so the keyboard header stays in sync
+            _skey = session_key or chat_id
+            self._session_current_model[_skey] = model_name
             # Forward to bus to update AgentLoop session model
             await self._handle_message(
                 sender_id=sender_id,
@@ -507,6 +513,13 @@ class TelegramChannel(BaseChannel):
                     )
                 return
 
+            _skey = session_key or chat_id
+            current_model = self._session_current_model.get(_skey, self.default_model)
+            keyboard_text = (
+                f"Current: {current_model}\n\nSelect a model:"
+                if current_model
+                else "Select a model:"
+            )
             keyboard = [
                 [InlineKeyboardButton(model, callback_data=f"model:{model}")]
                 for model in self.candidate_models
@@ -515,7 +528,7 @@ class TelegramChannel(BaseChannel):
             try:
                 await self._app.bot.send_message(
                     chat_id=int(chat_id),
-                    text="Select a model:",
+                    text=keyboard_text,
                     reply_markup=reply_markup,
                 )
             except Exception as e:
@@ -550,6 +563,10 @@ class TelegramChannel(BaseChannel):
 
         chat_id = str(query.message.chat_id)
         session_key = self._derive_topic_session_key(query.message)
+
+        # Record the switch so the next /model command shows the correct current model
+        _skey = session_key or chat_id
+        self._session_current_model[_skey] = model_name
 
         # Forward model switch to AgentLoop via bus
         await self._handle_message(
