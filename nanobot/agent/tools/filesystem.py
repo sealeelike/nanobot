@@ -2,7 +2,7 @@
 
 import difflib
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from nanobot.agent.tools.base import Tool
 
@@ -79,6 +79,11 @@ class WriteFileTool(Tool):
     def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
+        self._undo_callback: Callable[[dict[str, Any]], None] | None = None
+
+    def set_undo_callback(self, callback: Callable[[dict[str, Any]], None] | None) -> None:
+        """Set a callback invoked before each write with the pre-action state."""
+        self._undo_callback = callback
 
     @property
     def name(self) -> str:
@@ -102,6 +107,18 @@ class WriteFileTool(Tool):
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         try:
             file_path = _resolve_path(path, self._workspace, self._allowed_dir)
+            if self._undo_callback:
+                existed = file_path.exists()
+                try:
+                    prev_content = file_path.read_text(encoding="utf-8") if existed else None
+                except Exception:
+                    prev_content = None
+                self._undo_callback({
+                    "tool_name": self.name,
+                    "path": str(file_path),
+                    "existed_before": existed,
+                    "previous_content": prev_content,
+                })
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding="utf-8")
             return f"Successfully wrote {len(content)} bytes to {file_path}"
@@ -117,6 +134,11 @@ class EditFileTool(Tool):
     def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
+        self._undo_callback: Callable[[dict[str, Any]], None] | None = None
+
+    def set_undo_callback(self, callback: Callable[[dict[str, Any]], None] | None) -> None:
+        """Set a callback invoked before each edit with the pre-action state."""
+        self._undo_callback = callback
 
     @property
     def name(self) -> str:
@@ -153,6 +175,14 @@ class EditFileTool(Tool):
             count = content.count(old_text)
             if count > 1:
                 return f"Warning: old_text appears {count} times. Please provide more context to make it unique."
+
+            if self._undo_callback:
+                self._undo_callback({
+                    "tool_name": self.name,
+                    "path": str(file_path),
+                    "existed_before": True,
+                    "previous_content": content,
+                })
 
             new_content = content.replace(old_text, new_text, 1)
             file_path.write_text(new_content, encoding="utf-8")

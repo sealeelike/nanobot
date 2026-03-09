@@ -31,6 +31,7 @@ class Session:
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
     last_consolidated: int = 0  # Number of messages already consolidated to files
+    undo_log: list[dict[str, Any]] = field(default_factory=list)  # Reversible tool action log
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
@@ -63,10 +64,33 @@ class Session:
             out.append(entry)
         return out
 
+    def get_last_turn_start_index(self) -> int:
+        """Return the index of the last user message (start of last turn), or -1 if none."""
+        for i in range(len(self.messages) - 1, -1, -1):
+            if self.messages[i].get("role") == "user":
+                return i
+        return -1
+
+    def drop_last_turn(self) -> int:
+        """Remove the last conversation turn (from last user message onwards).
+
+        Returns the number of messages removed.  Safe to call on an empty
+        session — returns 0 without raising.
+        """
+        for i in range(len(self.messages) - 1, -1, -1):
+            if self.messages[i].get("role") == "user":
+                removed = len(self.messages) - i
+                self.messages = self.messages[:i]
+                self.last_consolidated = min(self.last_consolidated, len(self.messages))
+                self.updated_at = datetime.now()
+                return removed
+        return 0
+
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""
         self.messages = []
         self.last_consolidated = 0
+        self.undo_log = []
         self.updated_at = datetime.now()
 
 
@@ -133,6 +157,7 @@ class SessionManager:
             metadata = {}
             created_at = None
             last_consolidated = 0
+            undo_log: list[dict[str, Any]] = []
 
             with open(path, encoding="utf-8") as f:
                 for line in f:
@@ -146,6 +171,7 @@ class SessionManager:
                         metadata = data.get("metadata", {})
                         created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
                         last_consolidated = data.get("last_consolidated", 0)
+                        undo_log = data.get("undo_log", [])
                     else:
                         messages.append(data)
 
@@ -154,7 +180,8 @@ class SessionManager:
                 messages=messages,
                 created_at=created_at or datetime.now(),
                 metadata=metadata,
-                last_consolidated=last_consolidated
+                last_consolidated=last_consolidated,
+                undo_log=undo_log,
             )
         except Exception as e:
             logger.warning("Failed to load session {}: {}", key, e)
@@ -171,7 +198,8 @@ class SessionManager:
                 "created_at": session.created_at.isoformat(),
                 "updated_at": session.updated_at.isoformat(),
                 "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated
+                "last_consolidated": session.last_consolidated,
+                "undo_log": session.undo_log,
             }
             f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
             for msg in session.messages:
