@@ -65,6 +65,7 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        candidate_models: list[str] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
@@ -72,6 +73,7 @@ class AgentLoop:
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
+        self.candidate_models: list[str] = list(candidate_models or [])
         self.max_iterations = max_iterations
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -109,6 +111,7 @@ class AgentLoop:
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        self._session_models: dict[str, str] = {}  # Per-session model overrides
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
 
@@ -181,12 +184,14 @@ class AgentLoop:
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        model: str | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        effective_model = model or self.model
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -194,7 +199,7 @@ class AgentLoop:
             response = await self.provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
-                model=self.model,
+                model=effective_model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 reasoning_effort=self.reasoning_effort,
@@ -391,7 +396,31 @@ class AgentLoop:
                                   content="New session started.")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
+                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/model — List or switch the AI model\n/stop — Stop the current task\n/help — Show available commands")
+
+        # /model command — not saved to context
+        content_raw = msg.content.strip()
+        if cmd == "/model" or cmd.startswith("/model "):
+            parts = content_raw.split(None, 1)
+            if len(parts) == 1:
+                # List candidate models
+                models = self.candidate_models or [self.model]
+                model_list = "\n".join(models)
+                current = self._session_models.get(key, self.model)
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=f"Current model: `{current}`\n\nAvailable models:\n```\n{model_list}\n```\nUse `/model <name>` to switch.",
+                    metadata=dict(msg.metadata or {}),
+                )
+            else:
+                new_model = parts[1].strip()
+                self._session_models[key] = new_model
+                logger.info("Session {} switched to model: {}", key, new_model)
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=f"✅ Switched to: `{new_model}`",
+                    metadata={**dict(msg.metadata or {}), "_auto_delete": True},
+                )
 
         unconsolidated = len(session.messages) - session.last_consolidated
         if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
@@ -434,6 +463,7 @@ class AgentLoop:
 
         final_content, _, all_msgs = await self._run_agent_loop(
             initial_messages, on_progress=on_progress or _bus_progress,
+            model=self._session_models.get(key),
         )
 
         if final_content is None:
