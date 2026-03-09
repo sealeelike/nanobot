@@ -275,6 +275,8 @@ class AgentLoop:
 
             if msg.content.strip().lower() == "/stop":
                 await self._handle_stop(msg)
+            elif msg.content.strip().lower() == "/undo" and (msg.metadata or {}).get("_undo_preview"):
+                await self._handle_undo_preview(msg)
             elif msg.content.strip().lower() == "/undo":
                 await self._handle_undo(msg)
             else:
@@ -296,6 +298,58 @@ class AgentLoop:
         content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content,
+        ))
+
+    def _plan_undo(self, session_key: str) -> dict:
+        """Compute the undo plan for the last turn without applying it.
+
+        Returns a dict with:
+          ``nothing``            True if there is nothing to undo.
+          ``user_count``         Number of user messages that would be removed.
+          ``assistant_count``    Number of assistant messages that would be removed.
+          ``reversible_actions`` List of "<tool_name> <path>" strings for reversible ops.
+          ``non_reversible``     Sorted list of tool names that are not reversible.
+        """
+        session = self.sessions.get_or_create(session_key)
+        turn_start = session.get_last_turn_start_index()
+        if turn_start == -1:
+            return {"nothing": True}
+
+        last_turn_entries = [
+            e for e in session.undo_log if e.get("turn_start_index") == turn_start
+        ]
+        last_turn_msgs = session.messages[turn_start:]
+
+        non_reversible: set[str] = set()
+        for m in last_turn_msgs:
+            for tc in m.get("tool_calls") or []:
+                tool_name = tc.get("function", {}).get("name", "")
+                if tool_name and tool_name not in {"write_file", "edit_file", "read_file", "list_dir"}:
+                    non_reversible.add(tool_name)
+
+        reversible_actions: list[str] = []
+        for entry in last_turn_entries:
+            if entry.get("reversible", True):
+                reversible_actions.append(f"{entry['tool_name']} {entry['path']}")
+
+        user_count = sum(1 for m in last_turn_msgs if m.get("role") == "user")
+        assistant_count = sum(1 for m in last_turn_msgs if m.get("role") == "assistant")
+
+        return {
+            "nothing": False,
+            "user_count": user_count,
+            "assistant_count": assistant_count,
+            "reversible_actions": reversible_actions,
+            "non_reversible": sorted(non_reversible),
+        }
+
+    async def _handle_undo_preview(self, msg: InboundMessage) -> None:
+        """Return the undo plan without executing it (used for Telegram confirmation UI)."""
+        plan = self._plan_undo(msg.session_key)
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="",
+            metadata={**dict(msg.metadata or {}), "_undo_plan": plan},
         ))
 
     async def _handle_undo(self, msg: InboundMessage) -> None:

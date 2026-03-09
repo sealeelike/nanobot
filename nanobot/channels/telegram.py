@@ -190,6 +190,9 @@ class TelegramChannel(BaseChannel):
         # Each entry is {"user_msg_id": int|None, "bot_msg_ids": list[int]}.
         # New turns are appended; successful /undo pops the last entry.
         self._session_turn_stack: dict[str, list[dict]] = {}
+        # Pending undo confirmations: skey → {chat_id, session_key, user_msg_id, bot_msg_ids,
+        #   confirmation_msg_id, message_thread_id, sender_id}
+        self._pending_undo: dict[str, dict] = {}
 
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
@@ -240,6 +243,7 @@ class TelegramChannel(BaseChannel):
 
         # Add callback query handler for inline keyboard buttons
         self._app.add_handler(CallbackQueryHandler(self._on_model_callback, pattern="^model:"))
+        self._app.add_handler(CallbackQueryHandler(self._on_undo_callback, pattern="^undo_confirm:|^undo_cancel:"))
 
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
@@ -316,6 +320,11 @@ class TelegramChannel(BaseChannel):
 
         # Suppress responses for model switching when handled inline by Telegram
         if msg.metadata.get("_suppress_tg_response"):
+            return
+
+        # Handle undo plan response: show confirmation keyboard instead of a chat bubble.
+        if "_undo_plan" in msg.metadata:
+            await self._show_undo_confirmation(msg)
             return
 
         # Only stop typing indicator for final responses
@@ -633,8 +642,206 @@ class TelegramChannel(BaseChannel):
         except Exception as e:
             logger.debug("Failed to delete message {}: {}", message_id, e)
 
+    async def _show_undo_confirmation(self, msg: OutboundMessage) -> None:
+        """Display an inline-keyboard confirmation for /undo, or a self-deleting notice if nothing can be undone."""
+        plan: dict = msg.metadata.get("_undo_plan", {})
+        thread_id = msg.metadata.get("message_thread_id")
+        skey = (
+            f"telegram:{msg.chat_id}:topic:{thread_id}"
+            if thread_id else f"telegram:{msg.chat_id}"
+        )
+        thread_kwargs: dict = {}
+        if thread_id is not None:
+            thread_kwargs["message_thread_id"] = thread_id
+
+        self._stop_typing(msg.chat_id)
+
+        if plan.get("nothing"):
+            # Nothing to undo — send a short self-deleting notice.
+            try:
+                sent = await self._app.bot.send_message(
+                    chat_id=int(msg.chat_id),
+                    text="Nothing to undo.",
+                    **thread_kwargs,
+                )
+                asyncio.create_task(self._delete_after(msg.chat_id, sent.message_id))
+            except Exception as e:
+                logger.warning("Failed to send nothing-to-undo notice: {}", e)
+            return
+
+        # Build the confirmation summary from the plan.
+        user_count = plan.get("user_count", 0)
+        assistant_count = plan.get("assistant_count", 0)
+        reversible = plan.get("reversible_actions", [])
+        non_reversible = plan.get("non_reversible", [])
+
+        lines = ["↩️ Undo last turn?"]
+        msg_parts = []
+        if user_count:
+            msg_parts.append(f"{user_count} user message{'s' if user_count != 1 else ''}")
+        if assistant_count:
+            msg_parts.append(f"{assistant_count} nanobot message{'s' if assistant_count != 1 else ''}")
+        if msg_parts:
+            lines.append(f"Removes: {', '.join(msg_parts)}")
+        for action in reversible:
+            lines.append(f"• {action}")
+        for nr in non_reversible:
+            lines.append(f"• {nr} (not reversible)")
+
+        # Callback data uses skey as identifier; prefix must not exceed Telegram's 64-byte limit.
+        confirm_data = f"undo_confirm:{skey}"
+        cancel_data = f"undo_cancel:{skey}"
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Confirm", callback_data=confirm_data),
+            InlineKeyboardButton("❌ Cancel", callback_data=cancel_data),
+        ]])
+
+        try:
+            sent = await self._app.bot.send_message(
+                chat_id=int(msg.chat_id),
+                text="\n".join(lines),
+                reply_markup=keyboard,
+                **thread_kwargs,
+            )
+        except Exception as e:
+            logger.warning("Failed to send undo confirmation keyboard: {}", e)
+            return
+
+        # Capture turn-bubble IDs at the moment the confirmation is shown; these are the
+        # bubbles that will be deleted if the user confirms.
+        stack = self._session_turn_stack.get(skey, [])
+        top = stack[-1] if stack else {}
+
+        # Derive the session_key_override that AgentLoop uses for the actual apply.
+        # For topic-scoped sessions the override equals skey; for private chats it is None
+        # (the session is derived from channel:chat_id automatically).
+        session_key_override = skey if thread_id is not None else None
+
+        self._pending_undo[skey] = {
+            "chat_id": msg.chat_id,
+            "session_key": session_key_override,
+            "skey": skey,
+            "confirmation_msg_id": sent.message_id,
+            "user_msg_id": top.get("user_msg_id"),
+            "bot_msg_ids": list(top.get("bot_msg_ids", [])),
+            "message_thread_id": thread_id,
+            # Preserve enough metadata to re-publish the /undo apply message.
+            "inbound_metadata": {
+                k: v for k, v in (msg.metadata or {}).items()
+                if not k.startswith("_undo")
+            },
+            # Reconstruct sender_id from user_id + username stored in metadata.
+            "sender_id": (
+                f"{msg.metadata.get('user_id')}|{msg.metadata.get('username')}"
+                if msg.metadata.get("username")
+                else str(msg.metadata.get("user_id", ""))
+            ),
+        }
+
+    async def _on_undo_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle inline keyboard button press for undo confirmation."""
+        query = update.callback_query
+        if not query or not query.data or not update.effective_user:
+            return
+
+        user = update.effective_user
+        sender_id = self._sender_id(user)
+
+        if not self.is_allowed(sender_id):
+            await query.answer("Access denied.")
+            return
+
+        data: str = query.data
+        if data.startswith("undo_confirm:"):
+            skey = data[len("undo_confirm:"):]
+            await self._handle_undo_confirm(query, skey)
+        elif data.startswith("undo_cancel:"):
+            skey = data[len("undo_cancel:"):]
+            await self._handle_undo_cancel(query, skey)
+
+    async def _handle_undo_confirm(self, query, skey: str) -> None:
+        """Execute undo after the user clicked Confirm."""
+        pending = self._pending_undo.pop(skey, None)
+        if pending is None:
+            await query.answer("Undo already processed or expired.")
+            return
+
+        # Acknowledge immediately with a lightweight banner.
+        await query.answer("↩️ Undid last turn")
+
+        chat_id = pending["chat_id"]
+        confirmation_msg_id = pending["confirmation_msg_id"]
+        user_msg_id = pending.get("user_msg_id")
+        bot_msg_ids: list[int] = pending.get("bot_msg_ids", [])
+        thread_id = pending.get("message_thread_id")
+
+        # Delete the confirmation keyboard message.
+        try:
+            await self._app.bot.delete_message(
+                chat_id=int(chat_id), message_id=confirmation_msg_id
+            )
+        except Exception as e:
+            logger.debug("Could not delete undo confirmation message {}: {}", confirmation_msg_id, e)
+
+        # Delete the tracked user/bot message bubbles for the undone turn.
+        if user_msg_id is not None:
+            try:
+                await self._app.bot.delete_message(
+                    chat_id=int(chat_id), message_id=user_msg_id
+                )
+            except Exception as e:
+                logger.debug("Could not delete user message {}: {}", user_msg_id, e)
+        for bot_msg_id in bot_msg_ids:
+            try:
+                await self._app.bot.delete_message(
+                    chat_id=int(chat_id), message_id=bot_msg_id
+                )
+            except Exception as e:
+                logger.debug("Could not delete bot message {}: {}", bot_msg_id, e)
+
+        # Pop the undone turn from the local turn stack.
+        stack = self._session_turn_stack.get(skey)
+        if stack:
+            stack.pop()
+            if not stack:
+                del self._session_turn_stack[skey]
+
+        # Execute the actual backend undo via bus; suppress the response bubble since we
+        # already gave lightweight feedback via answerCallbackQuery above.
+        inbound_meta = dict(pending.get("inbound_metadata") or {})
+        inbound_meta["_suppress_tg_response"] = True
+        # Reconstruct session_key_override from skey for topic-scoped sessions.
+        session_key_override = pending.get("session_key") or (
+            skey if "topic" in skey else None
+        )
+        await self._handle_message(
+            sender_id=pending.get("sender_id", ""),
+            chat_id=chat_id,
+            content="/undo",
+            metadata=inbound_meta,
+            session_key=session_key_override,
+        )
+
+    async def _handle_undo_cancel(self, query, skey: str) -> None:
+        """Cancel the pending undo after the user clicked Cancel."""
+        pending = self._pending_undo.pop(skey, None)
+
+        await query.answer("Undo cancelled")
+
+        # Delete the confirmation keyboard message regardless.
+        if pending is None:
+            return
+        confirmation_msg_id = pending["confirmation_msg_id"]
+        chat_id = pending["chat_id"]
+        try:
+            await self._app.bot.delete_message(
+                chat_id=int(chat_id), message_id=confirmation_msg_id
+            )
+        except Exception as e:
+            logger.debug("Could not delete undo confirmation message {}: {}", confirmation_msg_id, e)
+
     async def _on_undo_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /undo: forward to AgentLoop; delete tracked turn messages only after confirmation."""
+        """Handle /undo: request an undo plan from AgentLoop then show a confirmation keyboard."""
         if not update.message or not update.effective_user:
             return
 
@@ -645,25 +852,19 @@ class TelegramChannel(BaseChannel):
         session_key = self._derive_topic_session_key(message)
         skey = session_key or f"telegram:{chat_id}"
 
-        # Delete the /undo command message itself (always safe — it belongs to the undo request).
+        # Delete the /undo command message itself (always safe).
         try:
             await message.delete()
         except Exception:
             pass
 
-        # Read the top of the turn stack but do NOT pop it yet.  We only delete prior-turn
-        # messages after the backend confirms the undo succeeded; we pass the IDs forward in
-        # metadata so that send() can perform the deletion once it sees _undo_succeeded=True.
+        # Forward /undo with the preview flag so AgentLoop returns a plan without executing.
+        # Candidate turn-bubble IDs are NOT passed here — they are captured when the
+        # confirmation keyboard is shown (inside _show_undo_confirmation), so that they
+        # reflect the stack state at the moment the user actually confirms.
         meta = self._build_message_metadata(message, user)
-        stack = self._session_turn_stack.get(skey, [])
-        if stack:
-            top = stack[-1]
-            if top.get("user_msg_id") is not None:
-                meta["_undo_candidate_user_msg_id"] = top["user_msg_id"]
-            if top.get("bot_msg_ids"):
-                meta["_undo_candidate_bot_msg_ids"] = list(top["bot_msg_ids"])
+        meta["_undo_preview"] = True
 
-        # Forward /undo to AgentLoop via bus
         await self._handle_message(
             sender_id=self._sender_id(user),
             chat_id=chat_id,
