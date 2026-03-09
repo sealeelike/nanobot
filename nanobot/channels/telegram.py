@@ -442,7 +442,8 @@ class TelegramChannel(BaseChannel):
 
         Deletes bubbles and pops the turn stack only on confirmed success.
         On expired/nothing/error, deletes the confirmation keyboard only, leaving
-        conversation bubbles intact.  Always sends a brief self-deleting notification.
+        conversation bubbles intact.  Uses answerCallbackQuery for all feedback —
+        no normal chat message bubbles are sent.
         """
         result: dict = msg.metadata.get("_undo_result", {})
         skey: str = msg.metadata.get("_pending_skey", f"telegram:{msg.chat_id}")
@@ -452,11 +453,16 @@ class TelegramChannel(BaseChannel):
 
         # Retrieve and clear the pending state regardless of outcome.
         pending = self._pending_undo.pop(skey, None)
+        callback_query_id: str | None = (pending or {}).get("callback_query_id")
 
-        thread_id = msg.metadata.get("message_thread_id")
-        thread_kwargs: dict = {}
-        if thread_id is not None:
-            thread_kwargs["message_thread_id"] = thread_id
+        async def _answer(text: str) -> None:
+            if callback_query_id:
+                try:
+                    await self._app.bot.answer_callback_query(
+                        callback_query_id=callback_query_id, text=text
+                    )
+                except Exception as e:
+                    logger.debug("Could not answer callback query for undo ({}): {}", status, e)
 
         # Always delete the confirmation keyboard message.
         if pending is not None:
@@ -496,37 +502,14 @@ class TelegramChannel(BaseChannel):
                 if not stack:
                     del self._session_turn_stack[skey]
 
-            # Send a brief self-deleting success notification.
-            try:
-                sent = await self._app.bot.send_message(
-                    chat_id=chat_id_int,
-                    text="↩️ Undid last turn",
-                    **thread_kwargs,
-                )
-                asyncio.create_task(self._delete_after(msg.chat_id, sent.message_id))
-            except Exception as e:
-                logger.warning("Failed to send undo success notification: {}", e)
+            # Lightweight banner via answerCallbackQuery — no chat bubble.
+            await _answer("↩️ Undid last turn")
 
         elif status == "expired":
-            notice = "⚠️ Undo expired: a new message was added after the confirmation was shown."
-            chat_id_int = int(msg.chat_id)
-            try:
-                sent = await self._app.bot.send_message(
-                    chat_id=chat_id_int, text=notice, **thread_kwargs,
-                )
-                asyncio.create_task(self._delete_after(msg.chat_id, sent.message_id))
-            except Exception as e:
-                logger.warning("Failed to send undo expired notice: {}", e)
+            await _answer("⚠️ Undo expired")
 
         elif status == "nothing":
-            chat_id_int = int(msg.chat_id)
-            try:
-                sent = await self._app.bot.send_message(
-                    chat_id=chat_id_int, text="Nothing to undo.", **thread_kwargs,
-                )
-                asyncio.create_task(self._delete_after(msg.chat_id, sent.message_id))
-            except Exception as e:
-                logger.warning("Failed to send nothing-to-undo notice: {}", e)
+            await _answer("Nothing to undo.")
 
     async def _send_text(
         self,
@@ -752,16 +735,7 @@ class TelegramChannel(BaseChannel):
         self._stop_typing(msg.chat_id)
 
         if plan.get("nothing"):
-            # Nothing to undo — send a short self-deleting notice.
-            try:
-                sent = await self._app.bot.send_message(
-                    chat_id=int(msg.chat_id),
-                    text="Nothing to undo.",
-                    **thread_kwargs,
-                )
-                asyncio.create_task(self._delete_after(msg.chat_id, sent.message_id))
-            except Exception as e:
-                logger.warning("Failed to send nothing-to-undo notice: {}", e)
+            # Nothing to undo — dismiss silently (no chat bubble).
             return
 
         # Build the confirmation summary from the plan.
@@ -862,9 +836,11 @@ class TelegramChannel(BaseChannel):
             await query.answer("Undo already processed or expired.")
             return
 
-        # Acknowledge the callback immediately so Telegram doesn't show a timeout spinner.
-        # We do NOT show "Undid last turn" yet — that only happens once the backend confirms.
-        await query.answer("")
+        # Store the callback_query_id so _handle_undo_result can answer the callback
+        # with the final result text (e.g. "↩️ Undid last turn") after the backend responds.
+        # We do NOT answer the callback here — that happens in _handle_undo_result so the
+        # popup shows the actual outcome, not just a neutral ack.
+        pending["callback_query_id"] = query.id
 
         turn_start_index = pending.get("turn_start_index")
         chat_id = pending["chat_id"]
