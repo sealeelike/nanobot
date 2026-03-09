@@ -8,8 +8,8 @@ import time
 import unicodedata
 
 from loguru import logger
-from telegram import BotCommand, ReplyParameters, Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyParameters, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
 from nanobot.bus.events import OutboundMessage
@@ -160,6 +160,7 @@ class TelegramChannel(BaseChannel):
     BOT_COMMANDS = [
         BotCommand("start", "Start the bot"),
         BotCommand("new", "Start a new conversation"),
+        BotCommand("model", "List or switch the AI model"),
         BotCommand("stop", "Stop the current task"),
         BotCommand("help", "Show available commands"),
     ]
@@ -169,10 +170,12 @@ class TelegramChannel(BaseChannel):
         config: TelegramConfig,
         bus: MessageBus,
         groq_api_key: str = "",
+        candidate_models: list[str] | None = None,
     ):
         super().__init__(config, bus)
         self.config: TelegramConfig = config
         self.groq_api_key = groq_api_key
+        self.candidate_models: list[str] = list(candidate_models or [])
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
@@ -224,6 +227,10 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(CommandHandler("new", self._forward_command))
         self._app.add_handler(CommandHandler("stop", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._on_help))
+        self._app.add_handler(CommandHandler("model", self._on_model_command))
+
+        # Add callback query handler for inline keyboard buttons
+        self._app.add_handler(CallbackQueryHandler(self._on_model_callback, pattern="^model:"))
 
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
@@ -252,7 +259,7 @@ class TelegramChannel(BaseChannel):
 
         # Start polling (this runs until stopped)
         await self._app.updater.start_polling(
-            allowed_updates=["message"],
+            allowed_updates=["message", "callback_query"],
             drop_pending_updates=True  # Ignore old messages on startup
         )
 
@@ -296,6 +303,10 @@ class TelegramChannel(BaseChannel):
         """Send a message through Telegram."""
         if not self._app:
             logger.warning("Telegram bot not running")
+            return
+
+        # Suppress responses for model switching when handled inline by Telegram
+        if msg.metadata.get("_suppress_tg_response"):
             return
 
         # Only stop typing indicator for final responses
@@ -353,11 +364,14 @@ class TelegramChannel(BaseChannel):
         # Send text content
         if msg.content and msg.content != "[empty message]":
             is_progress = msg.metadata.get("_progress", False)
+            auto_delete = msg.metadata.get("_auto_delete", False)
 
             for chunk in split_message(msg.content, TELEGRAM_MAX_MESSAGE_LEN):
                 # Final response: simulate streaming via draft, then persist
                 if not is_progress:
-                    await self._send_with_streaming(chat_id, chunk, reply_params, thread_kwargs)
+                    sent = await self._send_with_streaming(chat_id, chunk, reply_params, thread_kwargs)
+                    if auto_delete and sent is not None:
+                        asyncio.create_task(self._delete_after(msg.chat_id, sent.message_id))
                 else:
                     await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
 
@@ -367,11 +381,11 @@ class TelegramChannel(BaseChannel):
         text: str,
         reply_params=None,
         thread_kwargs: dict | None = None,
-    ) -> None:
-        """Send a plain text message with HTML fallback."""
+    ) -> Message | None:
+        """Send a plain text message with HTML fallback. Returns the sent message or None."""
         try:
             html = _markdown_to_telegram_html(text)
-            await self._app.bot.send_message(
+            return await self._app.bot.send_message(
                 chat_id=chat_id, text=html, parse_mode="HTML",
                 reply_parameters=reply_params,
                 **(thread_kwargs or {}),
@@ -379,7 +393,7 @@ class TelegramChannel(BaseChannel):
         except Exception as e:
             logger.warning("HTML parse failed, falling back to plain text: {}", e)
             try:
-                await self._app.bot.send_message(
+                return await self._app.bot.send_message(
                     chat_id=chat_id,
                     text=text,
                     reply_parameters=reply_params,
@@ -387,6 +401,7 @@ class TelegramChannel(BaseChannel):
                 )
             except Exception as e2:
                 logger.error("Error sending Telegram message: {}", e2)
+        return None
 
     async def _send_with_streaming(
         self,
@@ -394,8 +409,8 @@ class TelegramChannel(BaseChannel):
         text: str,
         reply_params=None,
         thread_kwargs: dict | None = None,
-    ) -> None:
-        """Simulate streaming via send_message_draft, then persist with send_message."""
+    ) -> Message | None:
+        """Simulate streaming via send_message_draft, then persist with send_message. Returns sent message."""
         draft_id = int(time.time() * 1000) % (2**31)
         try:
             step = max(len(text) // 8, 40)
@@ -410,7 +425,7 @@ class TelegramChannel(BaseChannel):
             await asyncio.sleep(0.15)
         except Exception:
             pass
-        await self._send_text(chat_id, text, reply_params, thread_kwargs)
+        return await self._send_text(chat_id, text, reply_params, thread_kwargs)
 
     async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""
@@ -431,9 +446,128 @@ class TelegramChannel(BaseChannel):
         await update.message.reply_text(
             "🐈 nanobot commands:\n"
             "/new — Start a new conversation\n"
+            "/model — List or switch the AI model\n"
             "/stop — Stop the current task\n"
             "/help — Show available commands"
         )
+
+    async def _on_model_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /model command: show inline keyboard or switch model directly."""
+        if not update.message or not update.effective_user:
+            return
+
+        message = update.message
+        user = update.effective_user
+        self._remember_thread_context(message)
+        sender_id = self._sender_id(user)
+        chat_id = str(message.chat_id)
+        session_key = self._derive_topic_session_key(message)
+
+        # Delete user's /model message
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        # Check for inline argument: /model <name>
+        args = context.args or []
+        if args:
+            model_name = " ".join(args)
+            # Forward to bus to update AgentLoop session model
+            await self._handle_message(
+                sender_id=sender_id,
+                chat_id=chat_id,
+                content=f"/model {model_name}",
+                metadata={
+                    **self._build_message_metadata(message, user),
+                    "_suppress_tg_response": True,
+                },
+                session_key=session_key,
+            )
+            # Show brief confirmation that auto-deletes
+            try:
+                sent = await self._app.bot.send_message(
+                    chat_id=int(chat_id),
+                    text=f"✅ Switched to: {model_name}",
+                )
+                asyncio.create_task(self._delete_after(chat_id, sent.message_id))
+            except Exception as e:
+                logger.warning("Failed to send model switch confirmation: {}", e)
+        else:
+            # Show inline keyboard with candidate models
+            if not self.candidate_models:
+                # Fallback: forward to bus for plain-text listing
+                if self.is_allowed(sender_id):
+                    await self._handle_message(
+                        sender_id=sender_id,
+                        chat_id=chat_id,
+                        content="/model",
+                        metadata=self._build_message_metadata(message, user),
+                        session_key=session_key,
+                    )
+                return
+
+            keyboard = [
+                [InlineKeyboardButton(model, callback_data=f"model:{model}")]
+                for model in self.candidate_models
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            try:
+                await self._app.bot.send_message(
+                    chat_id=int(chat_id),
+                    text="Select a model:",
+                    reply_markup=reply_markup,
+                )
+            except Exception as e:
+                logger.warning("Failed to send model keyboard: {}", e)
+
+    async def _on_model_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle inline keyboard button press for model selection."""
+        query = update.callback_query
+        if not query or not query.data or not update.effective_user:
+            return
+
+        user = update.effective_user
+        sender_id = self._sender_id(user)
+
+        if not self.is_allowed(sender_id):
+            await query.answer("Access denied.")
+            return
+
+        model_name = query.data[len("model:"):]
+
+        # Acknowledge the callback and show notification to user
+        await query.answer(f"✅ Switched to: {model_name}")
+
+        # Delete the keyboard message
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
+        if not query.message:
+            return
+
+        chat_id = str(query.message.chat_id)
+        session_key = self._derive_topic_session_key(query.message)
+
+        # Forward model switch to AgentLoop via bus
+        await self._handle_message(
+            sender_id=sender_id,
+            chat_id=chat_id,
+            content=f"/model {model_name}",
+            metadata={"_suppress_tg_response": True},
+            session_key=session_key,
+        )
+
+    async def _delete_after(self, chat_id: str, message_id: int, delay: float = 3.0) -> None:
+        """Delete a message after a short delay."""
+        try:
+            await asyncio.sleep(delay)
+            if self._app:
+                await self._app.bot.delete_message(chat_id=int(chat_id), message_id=message_id)
+        except Exception as e:
+            logger.debug("Failed to delete message {}: {}", message_id, e)
 
     @staticmethod
     def _sender_id(user) -> str:

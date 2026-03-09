@@ -340,6 +340,7 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        candidate_models=config.agents.defaults.candidate_models,
     )
 
     # Set cron callback (needs agent)
