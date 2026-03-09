@@ -246,9 +246,14 @@ class _FakeApp:
         pass
 
 
-def _make_telegram_channel(candidate_models=None):
+def _make_telegram_channel(candidate_models=None, default_model=""):
     config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"])
-    channel = TelegramChannel(config, MessageBus(), candidate_models=candidate_models or [])
+    channel = TelegramChannel(
+        config,
+        MessageBus(),
+        candidate_models=candidate_models or [],
+        default_model=default_model,
+    )
     channel._app = _FakeApp()
     return channel
 
@@ -396,3 +401,124 @@ class TestTelegramModelCommand:
         # Directly call _delete_after with 0 delay to test the mechanism
         await channel._delete_after("123", 1, delay=0)
         assert (123, 1) in deleted
+
+    @pytest.mark.asyncio
+    async def test_model_keyboard_shows_default_model_as_current(self):
+        """/model keyboard header shows the configured default model when no switch has happened."""
+        channel = _make_telegram_channel(
+            candidate_models=["gpt-4o", "claude-3"],
+            default_model="gpt-4o",
+        )
+
+        fake_message = SimpleNamespace(
+            message_id=10,
+            chat_id=123,
+            chat=SimpleNamespace(type="private"),
+            text="/model",
+            message_thread_id=None,
+            delete=AsyncMock(),
+        )
+        fake_user = SimpleNamespace(id=1, username="alice", first_name="Alice")
+        fake_context = SimpleNamespace(args=[])
+        fake_update = SimpleNamespace(message=fake_message, effective_user=fake_user)
+
+        await channel._on_model_command(fake_update, fake_context)
+
+        sent = channel._app.bot.sent_messages
+        assert len(sent) == 1
+        assert "gpt-4o" in sent[0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_model_keyboard_shows_switched_model_as_current(self):
+        """After switching via callback, /model keyboard header shows the new model."""
+        channel = _make_telegram_channel(
+            candidate_models=["gpt-4o", "claude-3"],
+            default_model="gpt-4o",
+        )
+
+        async def _noop_handle(**kwargs):
+            pass
+
+        channel._handle_message = _noop_handle
+
+        # Simulate a model switch via inline button
+        fake_kb_message = SimpleNamespace(
+            message_id=20,
+            chat_id=123,
+            chat=SimpleNamespace(type="private"),
+            message_thread_id=None,
+            delete=AsyncMock(),
+        )
+        fake_query = SimpleNamespace(
+            data="model:claude-3",
+            message=fake_kb_message,
+            answer=AsyncMock(),
+        )
+        fake_user = SimpleNamespace(id=1, username="alice", first_name="Alice")
+        fake_context = SimpleNamespace()
+        fake_update = SimpleNamespace(callback_query=fake_query, effective_user=fake_user)
+
+        await channel._on_model_callback(fake_update, fake_context)
+
+        # Now send /model again — the keyboard should show "claude-3" as current
+        fake_message = SimpleNamespace(
+            message_id=30,
+            chat_id=123,
+            chat=SimpleNamespace(type="private"),
+            text="/model",
+            message_thread_id=None,
+            delete=AsyncMock(),
+        )
+        fake_update2 = SimpleNamespace(message=fake_message, effective_user=fake_user)
+        await channel._on_model_command(fake_update2, SimpleNamespace(args=[]))
+
+        sent = channel._app.bot.sent_messages
+        assert len(sent) == 1  # only the keyboard (callback deleted original)
+        assert "claude-3" in sent[0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_model_command_with_arg_records_current_model(self):
+        """/model <name> records the model so the next keyboard shows it as current."""
+        channel = _make_telegram_channel(
+            candidate_models=["gpt-4o", "claude-3"],
+            default_model="gpt-4o",
+        )
+
+        async def _noop_handle(**kwargs):
+            pass
+
+        channel._handle_message = _noop_handle
+
+        fake_message = SimpleNamespace(
+            message_id=10,
+            chat_id=123,
+            chat=SimpleNamespace(type="private"),
+            text="/model claude-3",
+            message_thread_id=None,
+            delete=AsyncMock(),
+        )
+        fake_user = SimpleNamespace(id=1, username="alice", first_name="Alice")
+        fake_update = SimpleNamespace(message=fake_message, effective_user=fake_user)
+
+        await channel._on_model_command(fake_update, SimpleNamespace(args=["claude-3"]))
+
+        # The channel should have recorded the new current model
+        assert channel._session_current_model.get("123") == "claude-3"
+
+        # Next /model keyboard should reflect it
+        fake_message2 = SimpleNamespace(
+            message_id=11,
+            chat_id=123,
+            chat=SimpleNamespace(type="private"),
+            text="/model",
+            message_thread_id=None,
+            delete=AsyncMock(),
+        )
+        fake_update2 = SimpleNamespace(message=fake_message2, effective_user=fake_user)
+        await channel._on_model_command(fake_update2, SimpleNamespace(args=[]))
+
+        sent = channel._app.bot.sent_messages
+        # Only the keyboard message is sent (confirmation auto-deletes, but that's a task)
+        keyboard_msgs = [m for m in sent if "reply_markup" in m]
+        assert len(keyboard_msgs) == 1
+        assert "claude-3" in keyboard_msgs[0]["text"]
