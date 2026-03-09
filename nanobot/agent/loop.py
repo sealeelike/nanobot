@@ -345,10 +345,24 @@ class AgentLoop:
         reverted: list[str] = []
         revert_errors: list[str] = []
         for entry in reversed(last_turn_entries):
+            if not entry.get("reversible", True):
+                revert_errors.append(
+                    f"{entry['tool_name']} {entry['path']}: prior content unavailable, not reverted"
+                )
+                continue
             try:
                 path = _Path(entry["path"])
                 if entry.get("existed_before"):
-                    path.write_text(entry.get("previous_content") or "", encoding="utf-8")
+                    # previous_content was successfully captured — restore it exactly.
+                    # Defensive guard: if somehow previous_content is not a string, treat
+                    # as non-reversible rather than corrupting the file.
+                    prev = entry["previous_content"]
+                    if not isinstance(prev, str):
+                        revert_errors.append(
+                            f"{entry['tool_name']} {entry['path']}: unexpected previous_content type, not reverted"
+                        )
+                        continue
+                    path.write_text(prev, encoding="utf-8")
                 else:
                     path.unlink(missing_ok=True)
                 reverted.append(f"{entry['tool_name']} {entry['path']}")
@@ -385,7 +399,7 @@ class AgentLoop:
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id,
             content="\n".join(lines),
-            metadata=dict(msg.metadata or {}),
+            metadata={**dict(msg.metadata or {}), "_undo_succeeded": True},
         ))
 
     async def _dispatch(self, msg: InboundMessage) -> None:
@@ -568,16 +582,18 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
-            model=self._session_models.get(key),
-        )
-
-        # Clear undo callbacks — they close over the current session/turn and must not leak
-        for _tool_name in ("write_file", "edit_file"):
-            if _tool := self.tools.get(_tool_name):
-                if hasattr(_tool, "set_undo_callback"):
-                    _tool.set_undo_callback(None)
+        try:
+            final_content, _, all_msgs = await self._run_agent_loop(
+                initial_messages, on_progress=on_progress or _bus_progress,
+                model=self._session_models.get(key),
+            )
+        finally:
+            # Always clear undo callbacks — they close over the current session/turn and
+            # must not leak to the next turn even if _run_agent_loop raised.
+            for _tool_name in ("write_file", "edit_file"):
+                if _tool := self.tools.get(_tool_name):
+                    if hasattr(_tool, "set_undo_callback"):
+                        _tool.set_undo_callback(None)
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."

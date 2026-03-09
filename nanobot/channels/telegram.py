@@ -392,6 +392,33 @@ class TelegramChannel(BaseChannel):
                 else:
                     await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
 
+        # After the full undo response has been sent, delete the prior-turn message bubbles
+        # only when the backend confirmed the undo actually succeeded.
+        if msg.metadata.get("_undo_succeeded"):
+            thread_id = msg.metadata.get("message_thread_id")
+            skey = (
+                f"telegram:{msg.chat_id}:topic:{thread_id}"
+                if thread_id else f"telegram:{msg.chat_id}"
+            )
+            user_msg_id = msg.metadata.get("_undo_candidate_user_msg_id")
+            if user_msg_id is not None:
+                try:
+                    await self._app.bot.delete_message(
+                        chat_id=int(msg.chat_id), message_id=user_msg_id
+                    )
+                except Exception as e:
+                    logger.debug("Could not delete user message {}: {}", user_msg_id, e)
+            for bot_msg_id in msg.metadata.get("_undo_candidate_bot_msg_ids", []):
+                try:
+                    await self._app.bot.delete_message(
+                        chat_id=int(msg.chat_id), message_id=bot_msg_id
+                    )
+                except Exception as e:
+                    logger.debug("Could not delete bot message {}: {}", bot_msg_id, e)
+            # Clear stale tracking for this session now that the turn was undone.
+            self._session_turn_user_msg_id.pop(skey, None)
+            self._session_turn_bot_msg_ids.pop(skey, None)
+
     async def _send_text(
         self,
         chat_id: int,
@@ -602,7 +629,7 @@ class TelegramChannel(BaseChannel):
             logger.debug("Failed to delete message {}: {}", message_id, e)
 
     async def _on_undo_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /undo: delete last-turn messages, then forward to AgentLoop."""
+        """Handle /undo: forward to AgentLoop; delete tracked turn messages only after confirmation."""
         if not update.message or not update.effective_user:
             return
 
@@ -613,36 +640,29 @@ class TelegramChannel(BaseChannel):
         session_key = self._derive_topic_session_key(message)
         skey = session_key or f"telegram:{chat_id}"
 
-        # Delete the /undo command message itself
+        # Delete the /undo command message itself (always safe — it belongs to the undo request).
         try:
             await message.delete()
         except Exception:
             pass
 
-        # Delete the last turn's user message bubble
-        if user_msg_id := self._session_turn_user_msg_id.pop(skey, None):
-            try:
-                await self._app.bot.delete_message(
-                    chat_id=int(chat_id), message_id=user_msg_id
-                )
-            except Exception as e:
-                logger.debug("Could not delete user message {}: {}", user_msg_id, e)
-
-        # Delete the last turn's bot message bubbles
-        for bot_msg_id in self._session_turn_bot_msg_ids.pop(skey, []):
-            try:
-                await self._app.bot.delete_message(
-                    chat_id=int(chat_id), message_id=bot_msg_id
-                )
-            except Exception as e:
-                logger.debug("Could not delete bot message {}: {}", bot_msg_id, e)
+        # Read tracked IDs but do NOT pop them yet.  We only delete prior-turn messages after
+        # the backend confirms the undo succeeded; we pass the IDs forward in metadata so that
+        # send() can perform the deletion once it sees _undo_succeeded=True.
+        meta = self._build_message_metadata(message, user)
+        user_msg_id = self._session_turn_user_msg_id.get(skey)
+        bot_msg_ids = list(self._session_turn_bot_msg_ids.get(skey, []))
+        if user_msg_id is not None:
+            meta["_undo_candidate_user_msg_id"] = user_msg_id
+        if bot_msg_ids:
+            meta["_undo_candidate_bot_msg_ids"] = bot_msg_ids
 
         # Forward /undo to AgentLoop via bus
         await self._handle_message(
             sender_id=self._sender_id(user),
             chat_id=chat_id,
             content="/undo",
-            metadata=self._build_message_metadata(message, user),
+            metadata=meta,
             session_key=session_key,
         )
 

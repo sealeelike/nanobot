@@ -678,10 +678,227 @@ class TestFiletoolUndoCallback:
             await tool.execute(path="x.txt", content="test")
             assert calls == []
 
+    @pytest.mark.asyncio
+    async def test_write_file_records_reversible_false_when_read_fails(self):
+        """WriteFileTool records reversible=False when prior content cannot be read."""
+        import unittest.mock as _mock
+        from nanobot.agent.tools.filesystem import WriteFileTool
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tool = WriteFileTool(workspace=Path(tmpdir))
+            recorded: list[dict] = []
+            tool.set_undo_callback(recorded.append)
+
+            target = Path(tmpdir) / "binary.bin"
+            target.write_bytes(b"\xff\xfe")  # Invalid UTF-8
+
+            # Patch read_text to raise to simulate an unreadable file
+            with _mock.patch.object(Path, "read_text", side_effect=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")):
+                await tool.execute(path="binary.bin", content="safe text")
+
+            assert len(recorded) == 1
+            assert recorded[0]["existed_before"] is True
+            assert recorded[0]["reversible"] is False
+            assert recorded[0]["previous_content"] is None
+
+    @pytest.mark.asyncio
+    async def test_write_file_new_file_records_reversible_true(self):
+        """WriteFileTool records reversible=True for a file that did not previously exist."""
+        from nanobot.agent.tools.filesystem import WriteFileTool
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tool = WriteFileTool(workspace=Path(tmpdir))
+            recorded: list[dict] = []
+            tool.set_undo_callback(recorded.append)
+
+            await tool.execute(path="brand_new.txt", content="hello")
+
+            assert len(recorded) == 1
+            assert recorded[0]["existed_before"] is False
+            assert recorded[0]["reversible"] is True
+            assert recorded[0]["previous_content"] is None
+
+    @pytest.mark.asyncio
+    async def test_handle_undo_skips_non_reversible_entries(self):
+        """_handle_undo skips entries with reversible=False and reports them as errors."""
+        loop, bus = _make_loop()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "file.bin"
+            target.write_bytes(b"\xff\xfe\x00\x00")
+
+            session = _make_session_with_turns(1)
+            session.undo_log = [{
+                "tool_name": "write_file",
+                "path": str(target),
+                "existed_before": True,
+                "previous_content": None,
+                "reversible": False,
+                "turn_start_index": 0,
+            }]
+
+            loop.sessions = MagicMock()
+            loop.sessions.get_or_create.return_value = session
+            loop.sessions.save = MagicMock()
+            loop.subagents.cancel_by_session = AsyncMock(return_value=0)
+
+            msg = InboundMessage(channel="cli", sender_id="u1", chat_id="c1", content="/undo")
+            await loop._handle_undo(msg)
+
+            response = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+            # The response should report an error for the non-reversible entry
+            assert "Error reverting" in response.content or "prior content unavailable" in response.content
+            # The file must NOT have been touched (not corrupted with empty string)
+            assert target.read_bytes() == b"\xff\xfe\x00\x00"
+
+    @pytest.mark.asyncio
+    async def test_handle_undo_does_not_write_none_as_empty_string(self):
+        """_handle_undo never restores a pre-existing file with None as empty string."""
+        loop, bus = _make_loop()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "important.txt"
+            target.write_text("real content", encoding="utf-8")
+
+            session = _make_session_with_turns(1)
+            # Simulate an entry where previous_content is None but existed_before=True
+            # (this should never be reversible=True, but guard against it defensively)
+            session.undo_log = [{
+                "tool_name": "write_file",
+                "path": str(target),
+                "existed_before": True,
+                "previous_content": None,
+                "reversible": False,  # must be False when previous_content is None
+                "turn_start_index": 0,
+            }]
+
+            loop.sessions = MagicMock()
+            loop.sessions.get_or_create.return_value = session
+            loop.sessions.save = MagicMock()
+            loop.subagents.cancel_by_session = AsyncMock(return_value=0)
+
+            msg = InboundMessage(channel="cli", sender_id="u1", chat_id="c1", content="/undo")
+            await loop._handle_undo(msg)
+
+            # File must remain unchanged — not overwritten with empty string
+            assert target.read_text(encoding="utf-8") == "real content"
+
+    @pytest.mark.asyncio
+    async def test_handle_undo_defensive_guard_for_non_string_previous_content(self):
+        """_handle_undo defensive guard: if previous_content is not a str, skip with error."""
+        loop, bus = _make_loop()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "guard.txt"
+            target.write_text("original", encoding="utf-8")
+
+            session = _make_session_with_turns(1)
+            # Malformed entry: reversible=True but previous_content is not a string
+            session.undo_log = [{
+                "tool_name": "write_file",
+                "path": str(target),
+                "existed_before": True,
+                "previous_content": None,   # incorrect — should never happen in practice
+                "reversible": True,          # misconfigured
+                "turn_start_index": 0,
+            }]
+
+            loop.sessions = MagicMock()
+            loop.sessions.get_or_create.return_value = session
+            loop.sessions.save = MagicMock()
+            loop.subagents.cancel_by_session = AsyncMock(return_value=0)
+
+            msg = InboundMessage(channel="cli", sender_id="u1", chat_id="c1", content="/undo")
+            await loop._handle_undo(msg)
+
+            response = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+            # Reports as an error, not a successful revert
+            assert "Error reverting" in response.content or "unexpected previous_content" in response.content
+            # File must NOT have been corrupted
+            assert target.read_text(encoding="utf-8") == "original"
+
 
 # ---------------------------------------------------------------------------
-# Telegram /undo command wiring tests
+# Bug 3: undo callback cleanup via try/finally
 # ---------------------------------------------------------------------------
+
+class TestUndoCallbackTryFinally:
+    @pytest.mark.asyncio
+    async def test_undo_callback_cleared_when_run_agent_loop_raises(self):
+        """Undo callbacks are cleared even when _run_agent_loop raises an exception."""
+        from nanobot.agent.tools.filesystem import WriteFileTool, EditFileTool
+
+        loop, bus = _make_loop()
+
+        # Use real file tools so we can check the callback state
+        with tempfile.TemporaryDirectory() as tmpdir:
+            write_tool = WriteFileTool(workspace=Path(tmpdir))
+            edit_tool = EditFileTool(workspace=Path(tmpdir))
+            loop.tools._tools = {
+                "write_file": write_tool,
+                "edit_file": edit_tool,
+            }
+
+            session = _make_session_with_turns(1)
+            loop.sessions = MagicMock()
+            loop.sessions.get_or_create.return_value = session
+            loop.sessions.save = MagicMock()
+
+            # Make _run_agent_loop raise
+            async def _raising_loop(*args, **kwargs):
+                raise RuntimeError("simulated loop failure")
+
+            loop._run_agent_loop = _raising_loop
+            loop.context = MagicMock()
+            loop.context.build_messages.return_value = []
+            loop.context._RUNTIME_CONTEXT_TAG = "__rt__"
+
+            msg = InboundMessage(channel="cli", sender_id="u1", chat_id="c1", content="hello")
+            try:
+                await loop._process_message(msg)
+            except Exception:
+                pass
+
+            # Callbacks must be cleared regardless of the exception
+            assert write_tool._undo_callback is None
+            assert edit_tool._undo_callback is None
+
+    @pytest.mark.asyncio
+    async def test_undo_callback_cleared_after_normal_completion(self):
+        """Undo callbacks are cleared after a normal (non-raising) _run_agent_loop."""
+        from nanobot.agent.tools.filesystem import WriteFileTool, EditFileTool
+
+        loop, bus = _make_loop()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            write_tool = WriteFileTool(workspace=Path(tmpdir))
+            edit_tool = EditFileTool(workspace=Path(tmpdir))
+            loop.tools._tools = {
+                "write_file": write_tool,
+                "edit_file": edit_tool,
+            }
+
+            session = _make_session_with_turns(0)
+            loop.sessions = MagicMock()
+            loop.sessions.get_or_create.return_value = session
+            loop.sessions.save = MagicMock()
+
+            async def _ok_loop(*args, **kwargs):
+                return ("done", [], [{"role": "user", "content": "hi"}])
+
+            loop._run_agent_loop = _ok_loop
+            loop.context = MagicMock()
+            loop.context.build_messages.return_value = [{"role": "user", "content": "hi"}]
+            loop.context._RUNTIME_CONTEXT_TAG = "__rt__"
+            loop.context.add_assistant_message.return_value = []
+
+            msg = InboundMessage(channel="cli", sender_id="u1", chat_id="c1", content="hello")
+            await loop._process_message(msg)
+
+            assert write_tool._undo_callback is None
+            assert edit_tool._undo_callback is None
+
+
 
 class _FakeSentMessage:
     def __init__(self, message_id: int) -> None:
@@ -753,8 +970,8 @@ class TestTelegramUndoCommand:
         assert "/undo" in replied[0]
 
     @pytest.mark.asyncio
-    async def test_undo_command_deletes_last_turn_messages(self):
-        """_on_undo_command deletes the tracked user and bot messages."""
+    async def test_undo_command_does_not_delete_messages_before_confirmation(self):
+        """_on_undo_command must NOT delete prior-turn messages before the backend responds."""
         channel = _make_telegram_channel()
         skey = "telegram:123"
         channel._session_turn_user_msg_id[skey] = 10
@@ -780,15 +997,20 @@ class TestTelegramUndoCommand:
 
         await channel._on_undo_command(fake_update, SimpleNamespace())
 
-        deleted = channel._app.bot.deleted_messages
-        deleted_ids = {msg_id for _, msg_id in deleted}
-        assert 10 in deleted_ids   # user message
-        assert 20 in deleted_ids   # bot message 1
-        assert 21 in deleted_ids   # bot message 2
+        # Prior-turn messages must NOT be deleted yet — only the /undo command itself.
+        deleted_ids = {msg_id for _, msg_id in channel._app.bot.deleted_messages}
+        assert 10 not in deleted_ids   # user message still present
+        assert 20 not in deleted_ids   # bot message still present
+        assert 21 not in deleted_ids   # bot message still present
+
+        # Candidate IDs must be forwarded in metadata so send() can delete them on confirmation.
+        assert len(forwarded) == 1
+        assert forwarded[0]["metadata"].get("_undo_candidate_user_msg_id") == 10
+        assert forwarded[0]["metadata"].get("_undo_candidate_bot_msg_ids") == [20, 21]
 
     @pytest.mark.asyncio
-    async def test_undo_command_clears_turn_tracking(self):
-        """After _on_undo_command, tracking dicts for session are cleared."""
+    async def test_undo_command_tracking_still_present_after_forwarding(self):
+        """Tracking dicts are NOT cleared by _on_undo_command — only by send() on confirmation."""
         channel = _make_telegram_channel()
         skey = "telegram:123"
         channel._session_turn_user_msg_id[skey] = 10
@@ -811,8 +1033,61 @@ class TestTelegramUndoCommand:
 
         await channel._on_undo_command(fake_update, SimpleNamespace())
 
+        # Tracking dicts are still present — they'll be cleared by send() after confirmation.
+        assert channel._session_turn_user_msg_id.get(skey) == 10
+        assert channel._session_turn_bot_msg_ids.get(skey) == [20]
+
+    @pytest.mark.asyncio
+    async def test_send_deletes_tracked_messages_on_undo_success(self):
+        """send() deletes prior-turn messages when _undo_succeeded=True."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_user_msg_id[skey] = 10
+        channel._session_turn_bot_msg_ids[skey] = [20, 21]
+
+        await channel.send(OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="↩️ Undid last turn",
+            metadata={
+                "_undo_succeeded": True,
+                "_undo_candidate_user_msg_id": 10,
+                "_undo_candidate_bot_msg_ids": [20, 21],
+            },
+        ))
+
+        deleted_ids = {msg_id for _, msg_id in channel._app.bot.deleted_messages}
+        assert 10 in deleted_ids   # user message deleted
+        assert 20 in deleted_ids   # bot message 1 deleted
+        assert 21 in deleted_ids   # bot message 2 deleted
+        # Tracking cleared after successful undo
         assert skey not in channel._session_turn_user_msg_id
         assert skey not in channel._session_turn_bot_msg_ids
+
+    @pytest.mark.asyncio
+    async def test_send_does_not_delete_on_nothing_to_undo(self):
+        """send() must not delete prior-turn messages when undo found nothing to undo."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_user_msg_id[skey] = 10
+        channel._session_turn_bot_msg_ids[skey] = [20]
+
+        await channel.send(OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="Nothing to undo.",
+            metadata={
+                # _undo_succeeded is intentionally absent / False
+                "_undo_candidate_user_msg_id": 10,
+                "_undo_candidate_bot_msg_ids": [20],
+            },
+        ))
+
+        deleted_ids = {msg_id for _, msg_id in channel._app.bot.deleted_messages}
+        assert 10 not in deleted_ids
+        assert 20 not in deleted_ids
+        # Tracking dicts remain unchanged
+        assert channel._session_turn_user_msg_id.get(skey) == 10
 
     @pytest.mark.asyncio
     async def test_undo_command_safe_when_no_prior_turn(self):

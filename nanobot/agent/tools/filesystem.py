@@ -109,16 +109,34 @@ class WriteFileTool(Tool):
             file_path = _resolve_path(path, self._workspace, self._allowed_dir)
             if self._undo_callback:
                 existed = file_path.exists()
-                try:
-                    prev_content = file_path.read_text(encoding="utf-8") if existed else None
-                except Exception:
-                    prev_content = None
-                self._undo_callback({
-                    "tool_name": self.name,
-                    "path": str(file_path),
-                    "existed_before": existed,
-                    "previous_content": prev_content,
-                })
+                if existed:
+                    try:
+                        prev_content = file_path.read_text(encoding="utf-8")
+                        self._undo_callback({
+                            "tool_name": self.name,
+                            "path": str(file_path),
+                            "existed_before": True,
+                            "previous_content": prev_content,
+                            "reversible": True,
+                        })
+                    except Exception:
+                        # Cannot safely capture prior content — mark as not reversible to
+                        # prevent silently restoring a binary/unreadable file as empty text.
+                        self._undo_callback({
+                            "tool_name": self.name,
+                            "path": str(file_path),
+                            "existed_before": True,
+                            "previous_content": None,
+                            "reversible": False,
+                        })
+                else:
+                    self._undo_callback({
+                        "tool_name": self.name,
+                        "path": str(file_path),
+                        "existed_before": False,
+                        "previous_content": None,
+                        "reversible": True,
+                    })
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding="utf-8")
             return f"Successfully wrote {len(content)} bytes to {file_path}"
