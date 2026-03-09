@@ -327,6 +327,11 @@ class TelegramChannel(BaseChannel):
             await self._show_undo_confirmation(msg)
             return
 
+        # Handle structured undo apply result: called after _handle_undo_apply() completes.
+        if "_undo_result" in msg.metadata:
+            await self._handle_undo_result(msg)
+            return
+
         # Only stop typing indicator for final responses
         if not msg.metadata.get("_progress", False):
             self._stop_typing(msg.chat_id)
@@ -403,8 +408,7 @@ class TelegramChannel(BaseChannel):
                 else:
                     await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
 
-        # After the full undo response has been sent, delete the prior-turn message bubbles
-        # only when the backend confirmed the undo actually succeeded.
+        # Legacy path: handle the old _undo_succeeded signal (for non-Telegram CLI flows).
         if msg.metadata.get("_undo_succeeded"):
             thread_id = msg.metadata.get("message_thread_id")
             skey = (
@@ -432,6 +436,97 @@ class TelegramChannel(BaseChannel):
                 stack.pop()
                 if not stack:
                     del self._session_turn_stack[skey]
+
+    async def _handle_undo_result(self, msg: OutboundMessage) -> None:
+        """Process the structured undo result published by _handle_undo_apply().
+
+        Deletes bubbles and pops the turn stack only on confirmed success.
+        On expired/nothing/error, deletes the confirmation keyboard only, leaving
+        conversation bubbles intact.  Always sends a brief self-deleting notification.
+        """
+        result: dict = msg.metadata.get("_undo_result", {})
+        skey: str = msg.metadata.get("_pending_skey", f"telegram:{msg.chat_id}")
+        status: str = result.get("status", "error")
+
+        self._stop_typing(msg.chat_id)
+
+        # Retrieve and clear the pending state regardless of outcome.
+        pending = self._pending_undo.pop(skey, None)
+
+        thread_id = msg.metadata.get("message_thread_id")
+        thread_kwargs: dict = {}
+        if thread_id is not None:
+            thread_kwargs["message_thread_id"] = thread_id
+
+        # Always delete the confirmation keyboard message.
+        if pending is not None:
+            confirmation_msg_id = pending.get("confirmation_msg_id")
+            chat_id_int = int(pending["chat_id"])
+            if confirmation_msg_id:
+                try:
+                    await self._app.bot.delete_message(
+                        chat_id=chat_id_int, message_id=confirmation_msg_id
+                    )
+                except Exception as e:
+                    logger.debug("Could not delete undo confirmation message {}: {}", confirmation_msg_id, e)
+
+        if status == "success" and pending is not None:
+            chat_id_int = int(pending["chat_id"])
+            # Delete the tracked user/bot message bubbles for the undone turn.
+            user_msg_id = pending.get("user_msg_id")
+            if user_msg_id is not None:
+                try:
+                    await self._app.bot.delete_message(
+                        chat_id=chat_id_int, message_id=user_msg_id
+                    )
+                except Exception as e:
+                    logger.debug("Could not delete user message {}: {}", user_msg_id, e)
+            for bot_msg_id in pending.get("bot_msg_ids", []):
+                try:
+                    await self._app.bot.delete_message(
+                        chat_id=chat_id_int, message_id=bot_msg_id
+                    )
+                except Exception as e:
+                    logger.debug("Could not delete bot message {}: {}", bot_msg_id, e)
+
+            # Pop the undone turn from the local turn stack.
+            stack = self._session_turn_stack.get(skey)
+            if stack:
+                stack.pop()
+                if not stack:
+                    del self._session_turn_stack[skey]
+
+            # Send a brief self-deleting success notification.
+            try:
+                sent = await self._app.bot.send_message(
+                    chat_id=chat_id_int,
+                    text="↩️ Undid last turn",
+                    **thread_kwargs,
+                )
+                asyncio.create_task(self._delete_after(msg.chat_id, sent.message_id))
+            except Exception as e:
+                logger.warning("Failed to send undo success notification: {}", e)
+
+        elif status == "expired":
+            notice = "⚠️ Undo expired: a new message was added after the confirmation was shown."
+            chat_id_int = int(msg.chat_id)
+            try:
+                sent = await self._app.bot.send_message(
+                    chat_id=chat_id_int, text=notice, **thread_kwargs,
+                )
+                asyncio.create_task(self._delete_after(msg.chat_id, sent.message_id))
+            except Exception as e:
+                logger.warning("Failed to send undo expired notice: {}", e)
+
+        elif status == "nothing":
+            chat_id_int = int(msg.chat_id)
+            try:
+                sent = await self._app.bot.send_message(
+                    chat_id=chat_id_int, text="Nothing to undo.", **thread_kwargs,
+                )
+                asyncio.create_task(self._delete_after(msg.chat_id, sent.message_id))
+            except Exception as e:
+                logger.warning("Failed to send nothing-to-undo notice: {}", e)
 
     async def _send_text(
         self,
@@ -721,6 +816,7 @@ class TelegramChannel(BaseChannel):
             "chat_id": msg.chat_id,
             "session_key": session_key_override,
             "skey": skey,
+            "turn_start_index": plan.get("turn_start_index"),
             "confirmation_msg_id": sent.message_id,
             "user_msg_id": top.get("user_msg_id"),
             "bot_msg_ids": list(top.get("bot_msg_ids", [])),
@@ -760,57 +856,27 @@ class TelegramChannel(BaseChannel):
             await self._handle_undo_cancel(query, skey)
 
     async def _handle_undo_confirm(self, query, skey: str) -> None:
-        """Execute undo after the user clicked Confirm."""
-        pending = self._pending_undo.pop(skey, None)
+        """Forward the undo apply request to the backend; bubble/stack cleanup happens in send()."""
+        pending = self._pending_undo.get(skey)
         if pending is None:
             await query.answer("Undo already processed or expired.")
             return
 
-        # Acknowledge immediately with a lightweight banner.
-        await query.answer("↩️ Undid last turn")
+        # Acknowledge the callback immediately so Telegram doesn't show a timeout spinner.
+        # We do NOT show "Undid last turn" yet — that only happens once the backend confirms.
+        await query.answer("")
 
+        turn_start_index = pending.get("turn_start_index")
         chat_id = pending["chat_id"]
-        confirmation_msg_id = pending["confirmation_msg_id"]
-        user_msg_id = pending.get("user_msg_id")
-        bot_msg_ids: list[int] = pending.get("bot_msg_ids", [])
-        thread_id = pending.get("message_thread_id")
-
-        # Delete the confirmation keyboard message.
-        try:
-            await self._app.bot.delete_message(
-                chat_id=int(chat_id), message_id=confirmation_msg_id
-            )
-        except Exception as e:
-            logger.debug("Could not delete undo confirmation message {}: {}", confirmation_msg_id, e)
-
-        # Delete the tracked user/bot message bubbles for the undone turn.
-        if user_msg_id is not None:
-            try:
-                await self._app.bot.delete_message(
-                    chat_id=int(chat_id), message_id=user_msg_id
-                )
-            except Exception as e:
-                logger.debug("Could not delete user message {}: {}", user_msg_id, e)
-        for bot_msg_id in bot_msg_ids:
-            try:
-                await self._app.bot.delete_message(
-                    chat_id=int(chat_id), message_id=bot_msg_id
-                )
-            except Exception as e:
-                logger.debug("Could not delete bot message {}: {}", bot_msg_id, e)
-
-        # Pop the undone turn from the local turn stack.
-        stack = self._session_turn_stack.get(skey)
-        if stack:
-            stack.pop()
-            if not stack:
-                del self._session_turn_stack[skey]
-
-        # Execute the actual backend undo via bus; suppress the response bubble since we
-        # already gave lightweight feedback via answerCallbackQuery above.
-        inbound_meta = dict(pending.get("inbound_metadata") or {})
-        inbound_meta["_suppress_tg_response"] = True
         session_key_override = pending.get("session_key")
+
+        # Forward the apply request to AgentLoop.  The backend will verify that the
+        # session's current last turn still matches turn_start_index before executing.
+        inbound_meta = dict(pending.get("inbound_metadata") or {})
+        inbound_meta["_undo_apply_turn_start"] = turn_start_index
+        # Pass the skey back so send() can look up the pending state.
+        inbound_meta["_pending_skey"] = skey
+
         await self._handle_message(
             sender_id=pending.get("sender_id", ""),
             chat_id=chat_id,

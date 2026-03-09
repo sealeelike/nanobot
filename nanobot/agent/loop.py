@@ -280,6 +280,8 @@ class AgentLoop:
                 await self._handle_stop(msg)
             elif msg.content.strip().lower() == "/undo" and (msg.metadata or {}).get("_undo_preview"):
                 await self._handle_undo_preview(msg)
+            elif msg.content.strip().lower() == "/undo" and (msg.metadata or {}).get("_undo_apply_turn_start") is not None:
+                await self._handle_undo_apply(msg)
             elif msg.content.strip().lower() == "/undo":
                 await self._handle_undo(msg)
             else:
@@ -308,6 +310,11 @@ class AgentLoop:
 
         Returns a dict with:
           ``nothing``            True if there is nothing to undo.
+          ``turn_start_index``   Stable index of the first message of the planned turn.
+                                 The apply step uses this to verify the turn is still the
+                                 same before executing, preventing accidental undo of a
+                                 different turn if a new message arrived between preview
+                                 and confirm.
           ``user_count``         Number of user messages that would be removed.
           ``assistant_count``    Number of assistant messages that would be removed.
           ``reversible_actions`` List of "<tool_name> <path>" strings for reversible ops.
@@ -340,6 +347,7 @@ class AgentLoop:
 
         return {
             "nothing": False,
+            "turn_start_index": turn_start,
             "user_count": user_count,
             "assistant_count": assistant_count,
             "reversible_actions": reversible_actions,
@@ -354,6 +362,118 @@ class AgentLoop:
             content="",
             metadata={**dict(msg.metadata or {}), "_undo_plan": plan},
         ))
+
+    async def _handle_undo_apply(self, msg: InboundMessage) -> None:
+        """Apply the undo for a specific planned turn, identified by turn_start_index.
+
+        This is the second phase of the two-phase undo flow used by Telegram.
+        The caller (Telegram confirm callback) stores the ``turn_start_index`` from the
+        plan and passes it back via ``msg.metadata["_undo_apply_turn_start"]``.  We
+        verify that the session's current last turn still matches that index before
+        executing anything — if a new message arrived between preview and confirm the
+        index will have shifted, and we return an ``expired`` result without touching
+        session state.
+
+        Returns a structured ``_undo_result`` dict in the outbound metadata:
+          status:          "success" | "nothing" | "expired" | "error"
+          turn_start_index: the requested turn index (echoed back)
+          user_count, assistant_count, reverted, revert_errors, non_reversible
+        """
+        from pathlib import Path as _Path
+
+        requested_turn: int = msg.metadata["_undo_apply_turn_start"]
+
+        # Cancel any in-progress tasks for the session first.
+        tasks = self._active_tasks.pop(msg.session_key, [])
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        await self.subagents.cancel_by_session(msg.session_key)
+
+        session = self.sessions.get_or_create(msg.session_key)
+
+        async def _publish_result(result: dict) -> None:
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="",
+                metadata={**dict(msg.metadata or {}), "_undo_result": result},
+            ))
+
+        # Verify that the current last turn is exactly the one that was previewed.
+        current_turn_start = session.get_last_turn_start_index()
+        if current_turn_start == -1:
+            await _publish_result({"status": "nothing", "turn_start_index": requested_turn})
+            return
+        if current_turn_start != requested_turn:
+            await _publish_result({"status": "expired", "turn_start_index": requested_turn})
+            return
+
+        turn_start = current_turn_start
+
+        # Collect undo log entries for the last turn.
+        last_turn_entries = [
+            e for e in session.undo_log if e.get("turn_start_index") == turn_start
+        ]
+
+        # Identify non-reversible tools used in the last turn.
+        last_turn_msgs = session.messages[turn_start:]
+        non_reversible: set[str] = set()
+        for m in last_turn_msgs:
+            for tc in m.get("tool_calls") or []:
+                tool_name = tc.get("function", {}).get("name", "")
+                if tool_name and tool_name not in self._REVERSIBLE_TOOLS:
+                    non_reversible.add(tool_name)
+
+        # Revert reversible tool actions in reverse order.
+        reverted: list[str] = []
+        revert_errors: list[str] = []
+        for entry in reversed(last_turn_entries):
+            if not entry.get("reversible", True):
+                revert_errors.append(
+                    f"{entry['tool_name']} {entry['path']}: prior content unavailable, not reverted"
+                )
+                continue
+            try:
+                path = _Path(entry["path"])
+                if entry.get("existed_before"):
+                    prev = entry["previous_content"]
+                    if not isinstance(prev, str):
+                        revert_errors.append(
+                            f"{entry['tool_name']} {entry['path']}: unexpected previous_content type, not reverted"
+                        )
+                        continue
+                    path.write_text(prev, encoding="utf-8")
+                else:
+                    path.unlink(missing_ok=True)
+                reverted.append(f"{entry['tool_name']} {entry['path']}")
+            except Exception as exc:
+                revert_errors.append(f"{entry['tool_name']} {entry['path']}: {exc}")
+
+        # Remove undo log entries for this turn.
+        session.undo_log = [e for e in session.undo_log if e.get("turn_start_index") != turn_start]
+
+        # Count messages being removed.
+        user_count = sum(1 for m in last_turn_msgs if m.get("role") == "user")
+        assistant_count = sum(1 for m in last_turn_msgs if m.get("role") == "assistant")
+
+        # Drop last turn from session history.
+        session.drop_last_turn()
+        self.sessions.save(session)
+
+        await _publish_result({
+            "status": "success",
+            "turn_start_index": turn_start,
+            "user_count": user_count,
+            "assistant_count": assistant_count,
+            "reverted": reverted,
+            "revert_errors": revert_errors,
+            "non_reversible": sorted(non_reversible),
+        })
 
     async def _handle_undo(self, msg: InboundMessage) -> None:
         """Cancel active tasks, revert last turn's file changes, and remove from history."""
