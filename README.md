@@ -160,22 +160,19 @@ nanobot onboard
 
 **2. Configure** (`~/.nanobot/config.json`)
 
-Add or merge these **two parts** into your config (other options have defaults).
+> [!IMPORTANT]
+> nanobot reads **only** `~/.nanobot/config.json` (or a path you pass with `-c`).
+> A `.env` file in the project directory is **not** loaded automatically.
 
-*Set your API key* (e.g. OpenRouter, recommended for global users):
+Here is a **minimal working config** — copy it to `~/.nanobot/config.json` and replace the values:
+
 ```json
 {
   "providers": {
     "openrouter": {
       "apiKey": "sk-or-v1-xxx"
     }
-  }
-}
-```
-
-*Set your model* (optionally pin a provider — defaults to auto-detection):
-```json
-{
+  },
   "agents": {
     "defaults": {
       "model": "anthropic/claude-opus-4-5",
@@ -184,6 +181,11 @@ Add or merge these **two parts** into your config (other options have defaults).
   }
 }
 ```
+
+> **Important:**
+> - Always set both `providers.<name>.apiKey` **and** `agents.defaults.model`.
+> - When using a gateway like OpenRouter, also set `agents.defaults.provider` to the gateway name (e.g. `"openrouter"`).
+> - If you leave `model` at the default Anthropic value but configure only an OpenAI-compatible key, nanobot will detect the mismatch and show a clear error at startup.
 
 **3. Chat**
 
@@ -701,6 +703,10 @@ Config file: `~/.nanobot/config.json`
 > - **VolcEngine Coding Plan**: If you're on VolcEngine's coding plan, set `"apiBase": "https://ark.cn-beijing.volces.com/api/coding/v3"` in your volcengine provider config.
 > - **Alibaba Cloud Coding Plan**: If you're on the Alibaba Cloud Coding Plan (BaiLian), set `"apiBase": "https://coding.dashscope.aliyuncs.com/v1"` in your dashscope provider config.
 
+> [!NOTE]
+> The endpoint URL field is named **`apiBase`** (camelCase in JSON, `api_base` in snake_case).
+> If you have an older config that uses `base_url` or `baseUrl`, nanobot will automatically migrate it on first load.
+
 | Provider | Purpose | Get API Key |
 |----------|---------|-------------|
 | `custom` | Any OpenAI-compatible endpoint (direct, no LiteLLM) | — |
@@ -763,6 +769,8 @@ nanobot agent -c ~/.nanobot-telegram/config.json -w /tmp/nanobot-telegram-test -
 
 Connects directly to any OpenAI-compatible endpoint — LM Studio, llama.cpp, Together AI, Fireworks, Azure OpenAI, or any self-hosted server. Bypasses LiteLLM; model name is passed as-is.
 
+**Recommended for third-party aggregation endpoints** (e.g. a single endpoint that serves many models). Set `providers.custom.apiBase` to the base URL and `agents.defaults.model` to the exact model ID the endpoint expects.
+
 ```json
 {
   "providers": {
@@ -773,13 +781,15 @@ Connects directly to any OpenAI-compatible endpoint — LM Studio, llama.cpp, To
   },
   "agents": {
     "defaults": {
-      "model": "your-model-name"
+      "model": "your-exact-model-id"
     }
   }
 }
 ```
 
 > For local servers that don't require a key, set `apiKey` to any non-empty string (e.g. `"no-key"`).
+>
+> **Why `custom` and not `openai`?** The `openai` provider applies model name transformations before calling the API. For third-party aggregation endpoints that expose a heterogeneous list of model IDs, `custom` sends the model name as-is and avoids ambiguity.
 
 </details>
 
@@ -1077,6 +1087,9 @@ The agent can also manage this file itself — ask it to "add a periodic task" a
 
 > [!TIP]
 > The `-v ~/.nanobot:/root/.nanobot` flag mounts your local config directory into the container, so your config and workspace persist across container restarts.
+
+> [!IMPORTANT]
+> **`.env` files are not loaded by the container.** The container only reads `~/.nanobot/config.json` (mounted from your host). Any `.env` file you create in the project directory will have no effect. Put all API keys and configuration directly in `~/.nanobot/config.json`.
 
 ### Docker Compose
 

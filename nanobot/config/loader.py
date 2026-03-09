@@ -72,4 +72,50 @@ def _migrate_config(data: dict) -> dict:
     exec_cfg = tools.get("exec", {})
     if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:
         tools["restrictToWorkspace"] = exec_cfg.pop("restrictToWorkspace")
+
+    # Migrate top-level default_provider → agents.defaults.provider
+    if "default_provider" in data:
+        agents = data.setdefault("agents", {})
+        defaults = agents.setdefault("defaults", {})
+        if "provider" not in defaults:
+            defaults["provider"] = data.pop("default_provider")
+        else:
+            data.pop("default_provider")
+
+    # Migrate old flat telegram config → channels.telegram
+    # Old format: {"telegram": {"bot_token": "...", "allowed_users": [...]}}
+    if "telegram" in data and isinstance(data["telegram"], dict):
+        old_tg = data.pop("telegram")
+        channels = data.setdefault("channels", {})
+        tg = channels.setdefault("telegram", {})
+        if "bot_token" in old_tg and "token" not in tg:
+            tg["token"] = old_tg["bot_token"]
+        if "allowed_users" in old_tg and "allowFrom" not in tg and "allow_from" not in tg:
+            tg["allowFrom"] = old_tg["allowed_users"]
+        # Copy any remaining keys that don't conflict
+        for k, v in old_tg.items():
+            if k not in ("bot_token", "allowed_users") and k not in tg:
+                tg[k] = v
+
+    # Migrate base_url → api_base / apiBase in all provider configs
+    # Handles both snake_case ("base_url") and camelCase ("baseUrl") old keys.
+    # Always removes the old key to avoid unrecognised-field warnings.
+    providers = data.get("providers", {})
+    if isinstance(providers, dict):
+        for _provider_name, pcfg in providers.items():
+            if not isinstance(pcfg, dict):
+                continue
+            # snake_case variant
+            if "base_url" in pcfg:
+                if "api_base" not in pcfg and "apiBase" not in pcfg:
+                    pcfg["apiBase"] = pcfg.pop("base_url")
+                else:
+                    pcfg.pop("base_url")
+            # camelCase variant (baseUrl)
+            if "baseUrl" in pcfg:
+                if "api_base" not in pcfg and "apiBase" not in pcfg:
+                    pcfg["apiBase"] = pcfg.pop("baseUrl")
+                else:
+                    pcfg.pop("baseUrl")
+
     return data

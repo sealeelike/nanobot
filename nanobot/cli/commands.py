@@ -220,6 +220,38 @@ def _make_provider(config: Config):
     provider_name = config.get_provider_name(model)
     p = config.get_provider(model)
 
+    # Detect model/provider mismatch: model looks like an Anthropic model but
+    # the resolved provider is not Anthropic (e.g. user set openai.api_key only,
+    # and the default model "anthropic/claude-opus-4-5" was kept unchanged).
+    _model_lower = model.lower()
+    _is_anthropic_model = _model_lower.startswith("anthropic/") or _model_lower.startswith("claude-")
+    _anthropic_key = config.providers.anthropic.api_key
+    if (
+        _is_anthropic_model
+        and provider_name != "anthropic"
+        and not _anthropic_key
+        and config.agents.defaults.provider == "auto"
+    ):
+        console.print("[red]Error: Model mismatch detected.[/red]")
+        console.print(
+            f"  The configured model [cyan]{model}[/cyan] requires an Anthropic API key,\n"
+            "  but no Anthropic key is set and a different provider was selected as fallback."
+        )
+        console.print("\nTo fix, choose one of the following:")
+        console.print(
+            "  1. Set an Anthropic key:  [cyan]providers.anthropic.apiKey[/cyan] in config.json"
+        )
+        console.print(
+            "  2. Set a matching model, e.g. for OpenAI:\n"
+            "       [cyan]agents.defaults.model = \"gpt-4o\"[/cyan]"
+        )
+        console.print(
+            "  3. Use a gateway (e.g. OpenRouter) that can serve Anthropic models:\n"
+            "       [cyan]providers.openrouter.apiKey[/cyan]  +  "
+            "[cyan]agents.defaults.provider = \"openrouter\"[/cyan]"
+        )
+        raise typer.Exit(1)
+
     # OpenAI Codex (OAuth)
     if provider_name == "openai_codex" or model.startswith("openai-codex/"):
         return OpenAICodexProvider(default_model=model)
