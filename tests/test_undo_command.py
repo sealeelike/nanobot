@@ -2267,3 +2267,127 @@ class TestTelegramUndoConfirmationUI:
         assert pending.get("turn_start_index") == 4
 
 
+
+
+# ---------------------------------------------------------------------------
+# UNDO_DIAG diagnostic logging tests
+# ---------------------------------------------------------------------------
+
+class TestUndoDiagnosticLogging:
+    """Tests for UNDO_DIAG diagnostic logging added to the Telegram undo path."""
+
+    # ---- _compact_stack ----
+
+    def test_compact_stack_empty(self):
+        """_compact_stack returns [] for an unknown skey."""
+        channel = _make_telegram_channel()
+        assert channel._compact_stack("telegram:99") == []
+
+    def test_compact_stack_returns_compact_format(self):
+        """_compact_stack returns a list of {u, b} dicts matching the turn stack."""
+        channel = _make_telegram_channel()
+        skey = "telegram:1"
+        channel._session_turn_stack[skey] = [
+            {"user_msg_id": 10, "bot_msg_ids": [20, 21]},
+            {"user_msg_id": 30, "bot_msg_ids": []},
+        ]
+        result = channel._compact_stack(skey)
+        assert result == [{"u": 10, "b": [20, 21]}, {"u": 30, "b": []}]
+
+    # ---- bot_msg_ids tracking ----
+
+    @pytest.mark.asyncio
+    async def test_two_bot_messages_tracked_in_same_turn(self):
+        """Two non-progress OutboundMessages for the same turn both end up in bot_msg_ids."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 5, "bot_msg_ids": []}]
+
+        for content in ("First reply", "Second reply"):
+            await channel.send(OutboundMessage(
+                channel="telegram", chat_id="123", content=content,
+                metadata={},
+            ))
+
+        turn = channel._session_turn_stack[skey][-1]
+        # Both bot message IDs must be tracked in the same turn entry.
+        assert len(turn["bot_msg_ids"]) == 2
+
+    # ---- snapshot ----
+
+    @pytest.mark.asyncio
+    async def test_snapshot_captures_all_bot_msg_ids(self):
+        """_show_undo_confirmation snapshot includes all tracked bot_msg_ids."""
+        channel = _make_telegram_channel()
+        skey = "telegram:456"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 10, "bot_msg_ids": [20, 21, 22]}]
+
+        plan = {
+            "nothing": False,
+            "turn_start_index": 2,
+            "user_count": 1,
+            "assistant_count": 3,
+            "reversible_actions": [],
+            "non_reversible": [],
+        }
+        await channel._show_undo_confirmation(OutboundMessage(
+            channel="telegram", chat_id="456", content="",
+            metadata={"_undo_plan": plan},
+        ))
+
+        pending = channel._pending_undo.get(skey, {})
+        assert pending.get("bot_msg_ids") == [20, 21, 22]
+
+    # ---- delete failure produces warning log ----
+
+    @pytest.mark.asyncio
+    async def test_delete_failure_produces_warning_log(self):
+        """When delete_message raises for one bot message, a warning is logged and other deletes proceed."""
+        channel = _make_telegram_channel()
+        skey = "telegram:789"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 10, "bot_msg_ids": [20, 21]}]
+        channel._pending_undo[skey] = {
+            "chat_id": "789",
+            "session_key": None,
+            "skey": skey,
+            "turn_start_index": 0,
+            "confirmation_msg_id": 99,
+            "user_msg_id": 10,
+            "bot_msg_ids": [20, 21],
+            "message_thread_id": None,
+            "inbound_metadata": {},
+            "sender_id": "",
+        }
+
+        # Make delete_message raise only for message_id=20.
+        original_delete = channel._app.bot.delete_message
+        call_count = {"n": 0}
+
+        async def selective_delete(chat_id, message_id):
+            call_count["n"] += 1
+            if message_id == 20:
+                raise RuntimeError("Telegram API error")
+            await original_delete(chat_id=chat_id, message_id=message_id)
+
+        channel._app.bot.delete_message = selective_delete
+
+        warning_calls = []
+        with patch("nanobot.channels.telegram.logger") as mock_logger:
+            mock_logger.warning.side_effect = lambda *a, **kw: warning_calls.append(a)
+            mock_logger.debug = MagicMock()
+            await channel.send(OutboundMessage(
+                channel="telegram", chat_id="789", content="",
+                metadata={
+                    "_undo_result": {"status": "success", "turn_start_index": 0},
+                    "_pending_skey": skey,
+                },
+            ))
+
+        # A warning must have been emitted for the failing message.
+        assert any("UNDO_DIAG delete_fail" in str(a) for a in warning_calls)
+
+        # The other messages (confirmation=99, user=10, bot=21) must still be deleted.
+        deleted_ids = {msg_id for _, msg_id in channel._app.bot.deleted_messages}
+        assert 99 in deleted_ids
+        assert 10 in deleted_ids
+        assert 21 in deleted_ids
