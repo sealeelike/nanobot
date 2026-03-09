@@ -275,6 +275,8 @@ class AgentLoop:
 
             if msg.content.strip().lower() == "/stop":
                 await self._handle_stop(msg)
+            elif msg.content.strip().lower() == "/undo":
+                await self._handle_undo(msg)
             else:
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(msg.session_key, []).append(task)
@@ -294,6 +296,110 @@ class AgentLoop:
         content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content,
+        ))
+
+    async def _handle_undo(self, msg: InboundMessage) -> None:
+        """Cancel active tasks, revert last turn's file changes, and remove from history."""
+        from pathlib import Path as _Path
+
+        # Cancel any in-progress tasks first (same logic as /stop)
+        tasks = self._active_tasks.pop(msg.session_key, [])
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        await self.subagents.cancel_by_session(msg.session_key)
+
+        session = self.sessions.get_or_create(msg.session_key)
+
+        # Find the start of the last turn
+        turn_start = session.get_last_turn_start_index()
+        if turn_start == -1:
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Nothing to undo.",
+                metadata=dict(msg.metadata or {}),
+            ))
+            return
+
+        # Collect undo log entries for the last turn
+        last_turn_entries = [
+            e for e in session.undo_log
+            if e.get("turn_start_index") == turn_start
+        ]
+
+        # Identify non-reversible tools used in the last turn
+        last_turn_msgs = session.messages[turn_start:]
+        non_reversible: set[str] = set()
+        for m in last_turn_msgs:
+            for tc in m.get("tool_calls") or []:
+                tool_name = tc.get("function", {}).get("name", "")
+                if tool_name and tool_name not in {"write_file", "edit_file", "read_file", "list_dir"}:
+                    non_reversible.add(tool_name)
+
+        # Revert reversible tool actions in reverse order
+        reverted: list[str] = []
+        revert_errors: list[str] = []
+        for entry in reversed(last_turn_entries):
+            if not entry.get("reversible", True):
+                revert_errors.append(
+                    f"{entry['tool_name']} {entry['path']}: prior content unavailable, not reverted"
+                )
+                continue
+            try:
+                path = _Path(entry["path"])
+                if entry.get("existed_before"):
+                    # previous_content was successfully captured — restore it exactly.
+                    # Defensive guard: if somehow previous_content is not a string, treat
+                    # as non-reversible rather than corrupting the file.
+                    prev = entry["previous_content"]
+                    if not isinstance(prev, str):
+                        revert_errors.append(
+                            f"{entry['tool_name']} {entry['path']}: unexpected previous_content type, not reverted"
+                        )
+                        continue
+                    path.write_text(prev, encoding="utf-8")
+                else:
+                    path.unlink(missing_ok=True)
+                reverted.append(f"{entry['tool_name']} {entry['path']}")
+            except Exception as exc:
+                revert_errors.append(f"{entry['tool_name']} {entry['path']}: {exc}")
+
+        # Remove undo log entries for this turn
+        session.undo_log = [e for e in session.undo_log if e.get("turn_start_index") != turn_start]
+
+        # Count messages being removed
+        user_count = sum(1 for m in last_turn_msgs if m.get("role") == "user")
+        assistant_count = sum(1 for m in last_turn_msgs if m.get("role") == "assistant")
+
+        # Drop last turn from session history
+        session.drop_last_turn()
+        self.sessions.save(session)
+
+        # Build structured summary
+        lines = ["↩️ Undid last turn"]
+        for r in reverted:
+            lines.append(f"• Reverted: {r}")
+        for e in revert_errors:
+            lines.append(f"• Error reverting: {e}")
+        msg_parts: list[str] = []
+        if user_count:
+            msg_parts.append(f"{user_count} user message{'s' if user_count != 1 else ''}")
+        if assistant_count:
+            msg_parts.append(f"{assistant_count} assistant message{'s' if assistant_count != 1 else ''}")
+        if msg_parts:
+            lines.append(f"• Removed: {', '.join(msg_parts)}")
+        for nr in sorted(non_reversible):
+            lines.append(f"• Not reverted: {nr} side effects")
+
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="\n".join(lines),
+            metadata={**dict(msg.metadata or {}), "_undo_succeeded": True},
         ))
 
     async def _dispatch(self, msg: InboundMessage) -> None:
@@ -396,7 +502,7 @@ class AgentLoop:
                                   content="New session started.")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/model — List or switch the AI model\n/stop — Stop the current task\n/help — Show available commands")
+                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/undo — Undo the last turn\n/model — List or switch the AI model\n/stop — Stop the current task\n/help — Show available commands")
 
         # /model command — not saved to context
         content_raw = msg.content.strip()
@@ -445,6 +551,21 @@ class AgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
+        # Set up undo callbacks so file tools can record pre-action state
+        turn_start = len(session.messages)
+
+        def _make_undo_callback(s=session, ts=turn_start):
+            def _cb(entry: dict) -> None:
+                entry["turn_start_index"] = ts
+                s.undo_log.append(entry)
+            return _cb
+
+        _undo_cb = _make_undo_callback()
+        for _tool_name in ("write_file", "edit_file"):
+            if _tool := self.tools.get(_tool_name):
+                if hasattr(_tool, "set_undo_callback"):
+                    _tool.set_undo_callback(_undo_cb)
+
         history = session.get_history(max_messages=self.memory_window)
         initial_messages = self.context.build_messages(
             history=history,
@@ -461,10 +582,18 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
-            model=self._session_models.get(key),
-        )
+        try:
+            final_content, _, all_msgs = await self._run_agent_loop(
+                initial_messages, on_progress=on_progress or _bus_progress,
+                model=self._session_models.get(key),
+            )
+        finally:
+            # Always clear undo callbacks — they close over the current session/turn and
+            # must not leak to the next turn even if _run_agent_loop raised.
+            for _tool_name in ("write_file", "edit_file"):
+                if _tool := self.tools.get(_tool_name):
+                    if hasattr(_tool, "set_undo_callback"):
+                        _tool.set_undo_callback(None)
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
