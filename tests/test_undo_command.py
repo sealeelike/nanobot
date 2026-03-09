@@ -909,6 +909,7 @@ class _FakeBot:
     def __init__(self) -> None:
         self.sent_messages: list[dict] = []
         self.deleted_messages: list[tuple] = []
+        self.answered_callbacks: list[dict] = []
         self.commands: list = []
 
     async def get_me(self):
@@ -923,6 +924,9 @@ class _FakeBot:
 
     async def delete_message(self, chat_id, message_id) -> None:
         self.deleted_messages.append((chat_id, message_id))
+
+    async def answer_callback_query(self, callback_query_id: str, text: str = "", **kwargs) -> None:
+        self.answered_callbacks.append({"callback_query_id": callback_query_id, "text": text, **kwargs})
 
 
 class _FakeApp:
@@ -971,7 +975,7 @@ class TestTelegramUndoCommand:
 
     @pytest.mark.asyncio
     async def test_undo_command_does_not_delete_messages_before_confirmation(self):
-        """_on_undo_command must NOT delete prior-turn messages before the backend responds."""
+        """_on_undo_command must NOT delete prior-turn messages; it requests a preview first."""
         channel = _make_telegram_channel()
         skey = "telegram:123"
         channel._session_turn_stack[skey] = [{"user_msg_id": 10, "bot_msg_ids": [20, 21]}]
@@ -1002,10 +1006,13 @@ class TestTelegramUndoCommand:
         assert 20 not in deleted_ids   # bot message still present
         assert 21 not in deleted_ids   # bot message still present
 
-        # Candidate IDs must be forwarded in metadata so send() can delete them on confirmation.
+        # _on_undo_command forwards a preview request (not an immediate execute).
         assert len(forwarded) == 1
-        assert forwarded[0]["metadata"].get("_undo_candidate_user_msg_id") == 10
-        assert forwarded[0]["metadata"].get("_undo_candidate_bot_msg_ids") == [20, 21]
+        assert forwarded[0]["metadata"].get("_undo_preview") is True
+        # Candidate IDs are NOT in the forwarded metadata — they are captured later when
+        # the confirmation keyboard is shown so they reflect the actual stack at confirm time.
+        assert "_undo_candidate_user_msg_id" not in forwarded[0]["metadata"]
+        assert "_undo_candidate_bot_msg_ids" not in forwarded[0]["metadata"]
 
     @pytest.mark.asyncio
     async def test_undo_command_tracking_still_present_after_forwarding(self):
@@ -1317,5 +1324,946 @@ class TestTelegramUndoCommand:
         stack = channel._session_turn_stack.get(skey, [])
         assert len(stack) == 1
         assert stack[0]["user_msg_id"] == 5
+
+
+# ---------------------------------------------------------------------------
+# Undo confirmation UI — plan, keyboard, confirm, cancel
+# ---------------------------------------------------------------------------
+
+class TestTelegramUndoConfirmationUI:
+    """Tests for the /undo confirmation keyboard UX introduced in the confirmation-step overhaul."""
+
+    # ---- _show_undo_confirmation ----
+
+    @pytest.mark.asyncio
+    async def test_show_undo_confirmation_sends_keyboard_with_plan(self):
+        """_show_undo_confirmation sends a message with an InlineKeyboardMarkup when there is something to undo."""
+        from telegram import InlineKeyboardMarkup
+
+        channel = _make_telegram_channel()
+        skey = "telegram:456"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 10, "bot_msg_ids": [20, 21]}]
+
+        plan = {
+            "nothing": False,
+            "user_count": 1,
+            "assistant_count": 2,
+            "reversible_actions": ["edit_file memory/MEMORY.md"],
+            "non_reversible": [],
+        }
+        await channel._show_undo_confirmation(OutboundMessage(
+            channel="telegram", chat_id="456", content="",
+            metadata={"_undo_plan": plan},
+        ))
+
+        sent = channel._app.bot.sent_messages
+        assert len(sent) == 1
+        assert isinstance(sent[0].get("reply_markup"), InlineKeyboardMarkup)
+        buttons = sent[0]["reply_markup"].inline_keyboard[0]
+        labels = [b.text for b in buttons]
+        assert "✅ Confirm" in labels
+        assert "❌ Cancel" in labels
+
+    @pytest.mark.asyncio
+    async def test_show_undo_confirmation_text_includes_plan_details(self):
+        """Confirmation message text includes user/bot count and reversible actions."""
+        channel = _make_telegram_channel()
+        skey = "telegram:456"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 10, "bot_msg_ids": [20]}]
+
+        plan = {
+            "nothing": False,
+            "user_count": 1,
+            "assistant_count": 1,
+            "reversible_actions": ["edit_file memory/MEMORY.md", "write_file workspace/USER.md"],
+            "non_reversible": ["exec"],
+        }
+        await channel._show_undo_confirmation(OutboundMessage(
+            channel="telegram", chat_id="456", content="",
+            metadata={"_undo_plan": plan},
+        ))
+
+        text = channel._app.bot.sent_messages[0]["text"]
+        assert "• edit_file memory/MEMORY.md" in text
+        assert "• write_file workspace/USER.md" in text
+        assert "exec" in text  # non-reversible tool mentioned with "(not reversible)"
+        assert "(not reversible)" in text
+        assert "1 user message" in text
+        assert "1 nanobot message" in text
+
+    @pytest.mark.asyncio
+    async def test_show_undo_confirmation_nothing_sends_no_chat_bubble(self):
+        """When nothing can be undone, NO chat bubble is sent — the preview silently dismisses."""
+        from telegram import InlineKeyboardMarkup
+
+        channel = _make_telegram_channel()
+        plan = {"nothing": True}
+
+        await channel._show_undo_confirmation(OutboundMessage(
+            channel="telegram", chat_id="789", content="",
+            metadata={"_undo_plan": plan},
+        ))
+
+        sent = channel._app.bot.sent_messages
+        assert len(sent) == 0
+
+    @pytest.mark.asyncio
+    async def test_show_undo_confirmation_stores_pending_state(self):
+        """_show_undo_confirmation stores the pending undo state keyed by skey."""
+        channel = _make_telegram_channel()
+        skey = "telegram:456"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 10, "bot_msg_ids": [20, 21]}]
+
+        plan = {
+            "nothing": False,
+            "user_count": 1,
+            "assistant_count": 1,
+            "reversible_actions": [],
+            "non_reversible": [],
+        }
+        await channel._show_undo_confirmation(OutboundMessage(
+            channel="telegram", chat_id="456", content="",
+            metadata={"_undo_plan": plan, "user_id": 7, "username": "alice"},
+        ))
+
+        assert skey in channel._pending_undo
+        pending = channel._pending_undo[skey]
+        assert pending["user_msg_id"] == 10
+        assert pending["bot_msg_ids"] == [20, 21]
+        assert pending["chat_id"] == "456"
+        assert pending["confirmation_msg_id"] == 1  # first sent message
+
+    # ---- send() routing for _undo_plan ----
+
+    @pytest.mark.asyncio
+    async def test_send_routes_undo_plan_to_confirmation(self):
+        """send() with _undo_plan in metadata shows confirmation keyboard, not a chat bubble."""
+        from telegram import InlineKeyboardMarkup
+
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 5, "bot_msg_ids": [50]}]
+
+        plan = {
+            "nothing": False,
+            "user_count": 1,
+            "assistant_count": 1,
+            "reversible_actions": [],
+            "non_reversible": [],
+        }
+        await channel.send(OutboundMessage(
+            channel="telegram", chat_id="123", content="",
+            metadata={"_undo_plan": plan},
+        ))
+
+        sent = channel._app.bot.sent_messages
+        assert len(sent) == 1
+        assert isinstance(sent[0].get("reply_markup"), InlineKeyboardMarkup)
+
+    @pytest.mark.asyncio
+    async def test_send_routes_nothing_to_undo_to_silent_dismiss(self):
+        """send() with _undo_plan={'nothing': True} sends no chat bubble — silently dismisses."""
+        channel = _make_telegram_channel()
+
+        await channel.send(OutboundMessage(
+            channel="telegram", chat_id="123", content="",
+            metadata={"_undo_plan": {"nothing": True}},
+        ))
+
+        sent = channel._app.bot.sent_messages
+        assert len(sent) == 0
+
+    # ---- _handle_undo_confirm ----
+
+    @pytest.mark.asyncio
+    async def test_confirm_does_not_delete_bubbles_immediately(self):
+        """_handle_undo_confirm does NOT delete bubbles immediately — it defers to send()."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 10, "bot_msg_ids": [20, 21]}]
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "session_key": None,
+            "skey": skey,
+            "turn_start_index": 0,
+            "confirmation_msg_id": 99,
+            "user_msg_id": 10,
+            "bot_msg_ids": [20, 21],
+            "message_thread_id": None,
+            "inbound_metadata": {},
+            "sender_id": "1|alice",
+        }
+
+        forwarded: list[dict] = []
+
+        async def _fake_handle(**kwargs):
+            forwarded.append(kwargs)
+
+        channel._handle_message = _fake_handle
+
+        fake_query = SimpleNamespace(
+            data=f"undo_confirm:{skey}",
+            id="cqid_test",
+            answer=AsyncMock(),
+        )
+        await channel._handle_undo_confirm(fake_query, skey)
+
+        # Nothing deleted yet — deletion happens only after backend confirms success.
+        deleted_ids = {msg_id for _, msg_id in channel._app.bot.deleted_messages}
+        assert 99 not in deleted_ids   # confirmation message NOT yet deleted
+        assert 10 not in deleted_ids   # user bubble NOT yet deleted
+        assert 20 not in deleted_ids   # bot bubble NOT yet deleted
+        assert 21 not in deleted_ids   # bot bubble NOT yet deleted
+
+    @pytest.mark.asyncio
+    async def test_handle_undo_result_success_deletes_bubbles(self):
+        """send() with _undo_result status=success deletes confirmation + turn bubbles."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 10, "bot_msg_ids": [20, 21]}]
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "session_key": None,
+            "skey": skey,
+            "turn_start_index": 0,
+            "confirmation_msg_id": 99,
+            "user_msg_id": 10,
+            "bot_msg_ids": [20, 21],
+            "message_thread_id": None,
+            "inbound_metadata": {},
+            "sender_id": "1|alice",
+        }
+
+        await channel.send(OutboundMessage(
+            channel="telegram", chat_id="123", content="",
+            metadata={
+                "_undo_result": {"status": "success", "turn_start_index": 0},
+                "_pending_skey": skey,
+            },
+        ))
+
+        deleted_ids = {msg_id for _, msg_id in channel._app.bot.deleted_messages}
+        assert 99 in deleted_ids   # confirmation message deleted
+        assert 10 in deleted_ids   # user bubble deleted
+        assert 20 in deleted_ids   # bot bubble deleted
+        assert 21 in deleted_ids   # bot bubble deleted
+
+    @pytest.mark.asyncio
+    async def test_handle_undo_result_success_pops_turn_stack(self):
+        """send() with _undo_result status=success pops the turn stack entry."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_stack[skey] = [
+            {"user_msg_id": 1, "bot_msg_ids": [2]},
+            {"user_msg_id": 10, "bot_msg_ids": [20]},
+        ]
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "session_key": None,
+            "skey": skey,
+            "turn_start_index": 2,
+            "confirmation_msg_id": 99,
+            "user_msg_id": 10,
+            "bot_msg_ids": [20],
+            "message_thread_id": None,
+            "inbound_metadata": {},
+            "sender_id": "",
+        }
+
+        await channel.send(OutboundMessage(
+            channel="telegram", chat_id="123", content="",
+            metadata={
+                "_undo_result": {"status": "success", "turn_start_index": 2},
+                "_pending_skey": skey,
+            },
+        ))
+
+        stack = channel._session_turn_stack.get(skey, [])
+        assert len(stack) == 1
+        assert stack[0]["user_msg_id"] == 1
+
+    @pytest.mark.asyncio
+    async def test_handle_undo_result_success_no_chat_bubble_no_callback_answer(self):
+        """send() with _undo_result status=success sends no chat bubble and no answerCallbackQuery."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 5, "bot_msg_ids": []}]
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "session_key": None,
+            "skey": skey,
+            "turn_start_index": 0,
+            "confirmation_msg_id": 99,
+            "user_msg_id": 5,
+            "bot_msg_ids": [],
+            "message_thread_id": None,
+            "inbound_metadata": {},
+            "sender_id": "",
+        }
+
+        await channel.send(OutboundMessage(
+            channel="telegram", chat_id="123", content="",
+            metadata={
+                "_undo_result": {"status": "success", "turn_start_index": 0},
+                "_pending_skey": skey,
+            },
+        ))
+
+        # No chat bubble and no answerCallbackQuery — result is conveyed by message deletion
+        assert len(channel._app.bot.sent_messages) == 0
+        assert len(channel._app.bot.answered_callbacks) == 0
+
+    @pytest.mark.asyncio
+    async def test_confirm_pops_turn_stack(self):
+        """After send() receives success result, the turn stack is popped (not by _handle_undo_confirm)."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_stack[skey] = [
+            {"user_msg_id": 1, "bot_msg_ids": [2]},
+            {"user_msg_id": 10, "bot_msg_ids": [20]},
+        ]
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "session_key": None,
+            "skey": skey,
+            "turn_start_index": 2,
+            "confirmation_msg_id": 99,
+            "user_msg_id": 10,
+            "bot_msg_ids": [20],
+            "message_thread_id": None,
+            "inbound_metadata": {},
+            "sender_id": "1|alice",
+        }
+
+        # Simulate confirm (does NOT pop stack)
+        channel._handle_message = AsyncMock()
+        fake_query = SimpleNamespace(data=f"undo_confirm:{skey}", id="cqid_stack", answer=AsyncMock())
+        await channel._handle_undo_confirm(fake_query, skey)
+
+        # Stack unchanged after confirm alone
+        assert len(channel._session_turn_stack.get(skey, [])) == 2
+
+        # Now simulate backend returning success
+        await channel.send(OutboundMessage(
+            channel="telegram", chat_id="123", content="",
+            metadata={"_undo_result": {"status": "success", "turn_start_index": 2}, "_pending_skey": skey},
+        ))
+
+        stack = channel._session_turn_stack.get(skey, [])
+        assert len(stack) == 1
+        assert stack[0]["user_msg_id"] == 1
+
+    @pytest.mark.asyncio
+    async def test_confirm_answers_callback_immediately(self):
+        """_handle_undo_confirm answers the callback immediately (no deferred answering)."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 5, "bot_msg_ids": [50]}]
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "session_key": None,
+            "skey": skey,
+            "turn_start_index": 0,
+            "confirmation_msg_id": 99,
+            "user_msg_id": 5,
+            "bot_msg_ids": [50],
+            "message_thread_id": None,
+            "inbound_metadata": {},
+            "sender_id": "1|alice",
+        }
+
+        channel._handle_message = AsyncMock()
+        fake_query = SimpleNamespace(data=f"undo_confirm:{skey}", id="cqid_immediate", answer=AsyncMock())
+        await channel._handle_undo_confirm(fake_query, skey)
+
+        # query.answer() MUST be called immediately — no deferred callback answering
+        fake_query.answer.assert_called_once()
+
+        # callback_query_id must NOT be stored — we no longer defer answering
+        assert "callback_query_id" not in channel._pending_undo.get(skey, {})
+
+        # No chat bubble sent
+        assert len(channel._app.bot.sent_messages) == 0
+
+    @pytest.mark.asyncio
+    async def test_confirm_forwards_undo_apply_to_bus_with_turn_start(self):
+        """Confirm forwards the /undo apply request with _undo_apply_turn_start in metadata."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 5, "bot_msg_ids": []}]
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "session_key": None,
+            "skey": skey,
+            "turn_start_index": 4,
+            "confirmation_msg_id": 99,
+            "user_msg_id": 5,
+            "bot_msg_ids": [],
+            "message_thread_id": None,
+            "inbound_metadata": {"user_id": 1},
+            "sender_id": "1|alice",
+        }
+
+        forwarded: list[dict] = []
+
+        async def _fake_handle(**kwargs):
+            forwarded.append(kwargs)
+
+        channel._handle_message = _fake_handle
+        fake_query = SimpleNamespace(data=f"undo_confirm:{skey}", id="cqid_fwd", answer=AsyncMock())
+        await channel._handle_undo_confirm(fake_query, skey)
+
+        assert len(forwarded) == 1
+        assert forwarded[0]["content"] == "/undo"
+        # Must carry the turn_start_index so backend can verify the correct turn
+        assert forwarded[0]["metadata"].get("_undo_apply_turn_start") == 4
+        # Must carry the skey so send() can look up pending state
+        assert forwarded[0]["metadata"].get("_pending_skey") == skey
+        # Must NOT claim suppress — backend will return a structured _undo_result
+        assert "_suppress_tg_response" not in forwarded[0]["metadata"]
+
+    @pytest.mark.asyncio
+    async def test_confirm_keeps_pending_state_until_result(self):
+        """_handle_undo_confirm keeps pending state — it's cleared only by send() on result."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 5, "bot_msg_ids": []}]
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "session_key": None,
+            "skey": skey,
+            "turn_start_index": 0,
+            "confirmation_msg_id": 99,
+            "user_msg_id": 5,
+            "bot_msg_ids": [],
+            "message_thread_id": None,
+            "inbound_metadata": {},
+            "sender_id": "",
+        }
+
+        channel._handle_message = AsyncMock()
+        fake_query = SimpleNamespace(data=f"undo_confirm:{skey}", id="cqid_keep", answer=AsyncMock())
+        await channel._handle_undo_confirm(fake_query, skey)
+
+        # Pending state must still be present — not yet cleared
+        assert skey in channel._pending_undo
+
+    @pytest.mark.asyncio
+    async def test_handle_undo_result_clears_pending_state(self):
+        """send() with _undo_result clears the pending state regardless of status."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "confirmation_msg_id": 99,
+            "user_msg_id": 5,
+            "bot_msg_ids": [],
+            "message_thread_id": None,
+        }
+
+        await channel.send(OutboundMessage(
+            channel="telegram", chat_id="123", content="",
+            metadata={
+                "_undo_result": {"status": "success"},
+                "_pending_skey": skey,
+            },
+        ))
+
+        assert skey not in channel._pending_undo
+
+    @pytest.mark.asyncio
+    async def test_confirm_handles_already_processed(self):
+        """Confirm on an already-processed skey returns a graceful answer."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        # No pending state — already processed
+        fake_query = SimpleNamespace(data=f"undo_confirm:{skey}", answer=AsyncMock())
+        await channel._handle_undo_confirm(fake_query, skey)
+
+        fake_query.answer.assert_called_once()
+        call_text = fake_query.answer.call_args[0][0]
+        assert "expired" in call_text.lower() or "processed" in call_text.lower()
+
+    # ---- _handle_undo_cancel ----
+
+    @pytest.mark.asyncio
+    async def test_cancel_deletes_confirmation_message_only(self):
+        """Clicking Cancel deletes only the confirmation keyboard message."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 10, "bot_msg_ids": [20]}]
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "session_key": None,
+            "skey": skey,
+            "confirmation_msg_id": 99,
+            "user_msg_id": 10,
+            "bot_msg_ids": [20],
+            "message_thread_id": None,
+            "inbound_metadata": {},
+            "sender_id": "",
+        }
+
+        fake_query = SimpleNamespace(data=f"undo_cancel:{skey}", answer=AsyncMock())
+        await channel._handle_undo_cancel(fake_query, skey)
+
+        deleted_ids = {msg_id for _, msg_id in channel._app.bot.deleted_messages}
+        assert 99 in deleted_ids   # confirmation message deleted
+        assert 10 not in deleted_ids   # user bubble preserved
+        assert 20 not in deleted_ids   # bot bubble preserved
+
+    @pytest.mark.asyncio
+    async def test_cancel_does_not_change_turn_stack(self):
+        """Clicking Cancel leaves the turn stack unchanged."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 10, "bot_msg_ids": [20]}]
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "session_key": None,
+            "skey": skey,
+            "confirmation_msg_id": 99,
+            "user_msg_id": 10,
+            "bot_msg_ids": [20],
+            "message_thread_id": None,
+            "inbound_metadata": {},
+            "sender_id": "",
+        }
+
+        fake_query = SimpleNamespace(data=f"undo_cancel:{skey}", answer=AsyncMock())
+        await channel._handle_undo_cancel(fake_query, skey)
+
+        stack = channel._session_turn_stack.get(skey, [])
+        assert len(stack) == 1
+        assert stack[0]["user_msg_id"] == 10
+
+    @pytest.mark.asyncio
+    async def test_cancel_uses_callback_answer(self):
+        """Cancel uses answerCallbackQuery for feedback, not a chat bubble."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "confirmation_msg_id": 99,
+        }
+
+        fake_query = SimpleNamespace(data=f"undo_cancel:{skey}", answer=AsyncMock())
+        await channel._handle_undo_cancel(fake_query, skey)
+
+        fake_query.answer.assert_called_once()
+        call_text = fake_query.answer.call_args[0][0]
+        assert "cancel" in call_text.lower()
+        assert len(channel._app.bot.sent_messages) == 0
+
+    @pytest.mark.asyncio
+    async def test_cancel_removes_pending_state(self):
+        """After cancel, the pending state is removed from _pending_undo."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "confirmation_msg_id": 99,
+        }
+
+        fake_query = SimpleNamespace(data=f"undo_cancel:{skey}", answer=AsyncMock())
+        await channel._handle_undo_cancel(fake_query, skey)
+
+        assert skey not in channel._pending_undo
+
+    # ---- No persistent undo-result bubble ----
+
+    @pytest.mark.asyncio
+    async def test_no_chat_bubble_after_confirm(self):
+        """After full two-phase confirm, NO chat bubble is sent and NO answerCallbackQuery — result conveyed via message deletion."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 5, "bot_msg_ids": [50]}]
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "session_key": None,
+            "skey": skey,
+            "turn_start_index": 0,
+            "confirmation_msg_id": 99,
+            "user_msg_id": 5,
+            "bot_msg_ids": [50],
+            "message_thread_id": None,
+            "inbound_metadata": {},
+            "sender_id": "",
+        }
+
+        channel._handle_message = AsyncMock()
+        fake_query = SimpleNamespace(data=f"undo_confirm:{skey}", id="cqid_nobubble", answer=AsyncMock())
+        await channel._handle_undo_confirm(fake_query, skey)
+
+        # query.answer() called immediately by _handle_undo_confirm
+        fake_query.answer.assert_called_once()
+        # No chat messages from _handle_undo_confirm
+        assert len(channel._app.bot.sent_messages) == 0
+
+        # Simulate backend returning structured success result
+        await channel.send(OutboundMessage(
+            channel="telegram", chat_id="123", content="",
+            metadata={
+                "_undo_result": {"status": "success", "turn_start_index": 0},
+                "_pending_skey": skey,
+            },
+        ))
+
+        # Still NO chat bubble and no answerCallbackQuery after result
+        assert len(channel._app.bot.sent_messages) == 0
+        assert len(channel._app.bot.answered_callbacks) == 0
+
+    # ---- Consecutive undos remain UI-consistent ----
+
+    @pytest.mark.asyncio
+    async def test_consecutive_undos_remain_ui_consistent(self):
+        """Two consecutive /undos each process via the two-phase flow and delete correct bubbles."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        # Two turns in the stack
+        channel._session_turn_stack[skey] = [
+            {"user_msg_id": 1, "bot_msg_ids": [2, 3]},
+            {"user_msg_id": 10, "bot_msg_ids": [20, 21]},
+        ]
+
+        channel._handle_message = AsyncMock()
+
+        # --- First undo: confirm turn 2, receive success ---
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "session_key": None,
+            "skey": skey,
+            "turn_start_index": 2,
+            "confirmation_msg_id": 99,
+            "user_msg_id": 10,
+            "bot_msg_ids": [20, 21],
+            "message_thread_id": None,
+            "inbound_metadata": {},
+            "sender_id": "",
+        }
+        fake_query1 = SimpleNamespace(data=f"undo_confirm:{skey}", id="cqid_1", answer=AsyncMock())
+        await channel._handle_undo_confirm(fake_query1, skey)
+
+        # Bubbles not deleted yet
+        assert len(channel._app.bot.deleted_messages) == 0
+
+        # Backend returns success
+        await channel.send(OutboundMessage(
+            channel="telegram", chat_id="123", content="",
+            metadata={"_undo_result": {"status": "success", "turn_start_index": 2}, "_pending_skey": skey},
+        ))
+
+        deleted_after_first = {mid for _, mid in channel._app.bot.deleted_messages}
+        assert 10 in deleted_after_first   # turn-2 user bubble
+        assert 20 in deleted_after_first
+        assert 21 in deleted_after_first
+        assert 1 not in deleted_after_first   # turn-1 bubble untouched
+        assert 99 in deleted_after_first   # confirmation message
+
+        # Stack now has only turn 1
+        assert len(channel._session_turn_stack.get(skey, [])) == 1
+
+        # --- Second undo: confirm turn 1, receive success ---
+        channel._app.bot.deleted_messages.clear()  # reset for clarity
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "session_key": None,
+            "skey": skey,
+            "turn_start_index": 0,
+            "confirmation_msg_id": 100,
+            "user_msg_id": 1,
+            "bot_msg_ids": [2, 3],
+            "message_thread_id": None,
+            "inbound_metadata": {},
+            "sender_id": "",
+        }
+        fake_query2 = SimpleNamespace(data=f"undo_confirm:{skey}", id="cqid_2", answer=AsyncMock())
+        await channel._handle_undo_confirm(fake_query2, skey)
+
+        await channel.send(OutboundMessage(
+            channel="telegram", chat_id="123", content="",
+            metadata={"_undo_result": {"status": "success", "turn_start_index": 0}, "_pending_skey": skey},
+        ))
+
+        deleted_after_second = {mid for _, mid in channel._app.bot.deleted_messages}
+        assert 1 in deleted_after_second
+        assert 2 in deleted_after_second
+        assert 3 in deleted_after_second
+        assert 100 in deleted_after_second  # second confirmation message
+
+        # Stack is now empty
+        assert not channel._session_turn_stack.get(skey)
+
+    # ---- AgentLoop _plan_undo / _handle_undo_preview ----
+
+    def test_plan_undo_returns_nothing_for_empty_session(self):
+        """_plan_undo returns nothing:True when session has no messages."""
+        loop, _ = _make_loop()
+        session = Session(key="cli:c1")
+        loop.sessions = MagicMock()
+        loop.sessions.get_or_create.return_value = session
+
+        plan = loop._plan_undo("cli:c1")
+        assert plan["nothing"] is True
+
+    def test_plan_undo_returns_correct_counts(self):
+        """_plan_undo returns correct user/assistant counts from session messages."""
+        loop, _ = _make_loop()
+        session = _make_session_with_turns(2)
+        loop.sessions = MagicMock()
+        loop.sessions.get_or_create.return_value = session
+
+        plan = loop._plan_undo("cli:c1")
+        assert plan["nothing"] is False
+        assert plan["user_count"] == 1
+        assert plan["assistant_count"] == 1
+
+    def test_plan_undo_includes_reversible_actions(self):
+        """_plan_undo lists reversible actions from the undo_log."""
+        loop, _ = _make_loop()
+        session = _make_session_with_turns(1)
+        session.undo_log = [{
+            "tool_name": "edit_file",
+            "path": "memory/MEMORY.md",
+            "existed_before": True,
+            "previous_content": "old",
+            "turn_start_index": 0,
+            "reversible": True,
+        }]
+        loop.sessions = MagicMock()
+        loop.sessions.get_or_create.return_value = session
+
+        plan = loop._plan_undo("cli:c1")
+        assert "edit_file memory/MEMORY.md" in plan["reversible_actions"]
+
+    @pytest.mark.asyncio
+    async def test_handle_undo_preview_publishes_plan_not_execution(self):
+        """_handle_undo_preview publishes an _undo_plan without changing session history."""
+        loop, bus = _make_loop()
+        session = _make_session_with_turns(1)
+        loop.sessions = MagicMock()
+        loop.sessions.get_or_create.return_value = session
+        loop.subagents = MagicMock()
+        loop.subagents.cancel_by_session = AsyncMock(return_value=0)
+
+        msg = InboundMessage(
+            channel="telegram", sender_id="u1", chat_id="c1",
+            content="/undo",
+            metadata={"_undo_preview": True},
+        )
+        await loop._handle_undo_preview(msg)
+
+        out: OutboundMessage = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        assert "_undo_plan" in out.metadata
+        plan = out.metadata["_undo_plan"]
+        assert plan["nothing"] is False
+        assert plan["user_count"] == 1
+
+        # Session history must NOT have been modified
+        assert len(session.messages) == 2
+
+    def test_plan_undo_includes_turn_start_index(self):
+        """_plan_undo includes turn_start_index in the plan for turn binding."""
+        loop, _ = _make_loop()
+        session = _make_session_with_turns(2)
+        loop.sessions = MagicMock()
+        loop.sessions.get_or_create.return_value = session
+
+        plan = loop._plan_undo("cli:c1")
+        assert "turn_start_index" in plan
+        assert plan["turn_start_index"] == 2  # last turn starts at index 2 (4 messages: 0,1,2,3)
+
+    # ---- AgentLoop _handle_undo_apply ----
+
+    @pytest.mark.asyncio
+    async def test_handle_undo_apply_success(self):
+        """_handle_undo_apply undoes the exact planned turn and returns status=success."""
+        loop, bus = _make_loop()
+        session = _make_session_with_turns(1)
+        loop.sessions = MagicMock()
+        loop.sessions.get_or_create.return_value = session
+        loop.sessions.save = MagicMock()
+        loop.subagents = MagicMock()
+        loop.subagents.cancel_by_session = AsyncMock(return_value=0)
+
+        msg = InboundMessage(
+            channel="telegram", sender_id="u1", chat_id="c1",
+            content="/undo",
+            metadata={"_undo_apply_turn_start": 0, "_pending_skey": "telegram:c1"},
+        )
+        await loop._handle_undo_apply(msg)
+
+
+        out: OutboundMessage = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        assert "_undo_result" in out.metadata
+        result = out.metadata["_undo_result"]
+        assert result["status"] == "success"
+        assert result["turn_start_index"] == 0
+        assert result["user_count"] == 1
+        assert result["assistant_count"] == 1
+
+        # Session history must have been modified
+        assert len(session.messages) == 0
+
+    @pytest.mark.asyncio
+    async def test_handle_undo_apply_expired_when_turn_changed(self):
+        """_handle_undo_apply returns status=expired when current last turn != requested turn."""
+        loop, bus = _make_loop()
+        # Two turns: planned turn 0, but then a new turn (turn 2) is now the last
+        session = _make_session_with_turns(2)
+        loop.sessions = MagicMock()
+        loop.sessions.get_or_create.return_value = session
+        loop.subagents = MagicMock()
+        loop.subagents.cancel_by_session = AsyncMock(return_value=0)
+
+        # Request to undo turn at index 0 (the OLD last turn), but session now has turn at 2
+        msg = InboundMessage(
+            channel="telegram", sender_id="u1", chat_id="c1",
+            content="/undo",
+            metadata={"_undo_apply_turn_start": 0, "_pending_skey": "telegram:c1"},
+        )
+        await loop._handle_undo_apply(msg)
+
+        await asyncio.sleep(0)
+
+        out: OutboundMessage = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        result = out.metadata["_undo_result"]
+        assert result["status"] == "expired"
+        assert result["turn_start_index"] == 0
+
+        # Session history must NOT have been modified
+        assert len(session.messages) == 4
+
+    @pytest.mark.asyncio
+    async def test_handle_undo_apply_nothing_when_empty_session(self):
+        """_handle_undo_apply returns status=nothing when session has no messages."""
+        loop, bus = _make_loop()
+        session = Session(key="cli:c1")
+        loop.sessions = MagicMock()
+        loop.sessions.get_or_create.return_value = session
+        loop.subagents = MagicMock()
+        loop.subagents.cancel_by_session = AsyncMock(return_value=0)
+
+        msg = InboundMessage(
+            channel="telegram", sender_id="u1", chat_id="c1",
+            content="/undo",
+            metadata={"_undo_apply_turn_start": 0, "_pending_skey": "telegram:c1"},
+        )
+        await loop._handle_undo_apply(msg)
+
+        await asyncio.sleep(0)
+
+        out: OutboundMessage = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        result = out.metadata["_undo_result"]
+        assert result["status"] == "nothing"
+
+    # ---- Telegram expired/nothing handling ----
+
+    @pytest.mark.asyncio
+    async def test_handle_undo_result_expired_does_not_delete_bubbles(self):
+        """send() with _undo_result status=expired does NOT delete conversation bubbles."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 10, "bot_msg_ids": [20]}]
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "confirmation_msg_id": 99,
+            "user_msg_id": 10,
+            "bot_msg_ids": [20],
+            "message_thread_id": None,
+        }
+
+        await channel.send(OutboundMessage(
+            channel="telegram", chat_id="123", content="",
+            metadata={
+                "_undo_result": {"status": "expired", "turn_start_index": 0},
+                "_pending_skey": skey,
+            },
+        ))
+
+        deleted_ids = {msg_id for _, msg_id in channel._app.bot.deleted_messages}
+        # Confirmation message deleted
+        assert 99 in deleted_ids
+        # Conversation bubbles NOT deleted
+        assert 10 not in deleted_ids
+        assert 20 not in deleted_ids
+        # Turn stack unchanged
+        stack = channel._session_turn_stack.get(skey, [])
+        assert len(stack) == 1
+
+    @pytest.mark.asyncio
+    async def test_handle_undo_result_expired_no_chat_bubble_no_callback_answer(self):
+        """send() with _undo_result status=expired sends no chat bubble and no answerCallbackQuery."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "confirmation_msg_id": 99,
+            "user_msg_id": None,
+            "bot_msg_ids": [],
+            "message_thread_id": None,
+        }
+
+        await channel.send(OutboundMessage(
+            channel="telegram", chat_id="123", content="",
+            metadata={
+                "_undo_result": {"status": "expired"},
+                "_pending_skey": skey,
+            },
+        ))
+
+        # No chat bubble and no answerCallbackQuery — confirmation message is deleted
+        assert len(channel._app.bot.sent_messages) == 0
+        assert len(channel._app.bot.answered_callbacks) == 0
+
+    @pytest.mark.asyncio
+    async def test_handle_undo_result_nothing_no_chat_bubble_and_clears_pending(self):
+        """send() with _undo_result status=nothing sends no chat bubble and clears pending."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "confirmation_msg_id": 99,
+            "user_msg_id": None,
+            "bot_msg_ids": [],
+            "message_thread_id": None,
+        }
+
+        await channel.send(OutboundMessage(
+            channel="telegram", chat_id="123", content="",
+            metadata={
+                "_undo_result": {"status": "nothing"},
+                "_pending_skey": skey,
+            },
+        ))
+
+        # No chat bubble and no answerCallbackQuery
+        assert len(channel._app.bot.sent_messages) == 0
+        assert len(channel._app.bot.answered_callbacks) == 0
+        # Pending state cleared
+        assert skey not in channel._pending_undo
+
+    @pytest.mark.asyncio
+    async def test_show_undo_confirmation_stores_turn_start_index(self):
+        """_show_undo_confirmation stores turn_start_index from plan in pending state."""
+        channel = _make_telegram_channel()
+        skey = "telegram:456"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 10, "bot_msg_ids": [20]}]
+
+        plan = {
+            "nothing": False,
+            "turn_start_index": 4,
+            "user_count": 1,
+            "assistant_count": 1,
+            "reversible_actions": [],
+            "non_reversible": [],
+        }
+        await channel._show_undo_confirmation(OutboundMessage(
+            channel="telegram", chat_id="456", content="",
+            metadata={"_undo_plan": plan},
+        ))
+
+        pending = channel._pending_undo.get(skey, {})
+        assert pending.get("turn_start_index") == 4
 
 
