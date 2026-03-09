@@ -63,6 +63,21 @@ class Session:
             out.append(entry)
         return out
 
+    def drop_last_turn(self) -> int:
+        """Remove the last conversation turn (from last user message onwards).
+
+        Returns the number of messages removed.  Safe to call on an empty
+        session — returns 0 without raising.
+        """
+        for i in range(len(self.messages) - 1, -1, -1):
+            if self.messages[i].get("role") == "user":
+                removed = len(self.messages) - i
+                self.messages = self.messages[:i]
+                self.last_consolidated = min(self.last_consolidated, len(self.messages))
+                self.updated_at = datetime.now()
+                return removed
+        return 0
+
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""
         self.messages = []

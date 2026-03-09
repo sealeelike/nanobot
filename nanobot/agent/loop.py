@@ -275,6 +275,8 @@ class AgentLoop:
 
             if msg.content.strip().lower() == "/stop":
                 await self._handle_stop(msg)
+            elif msg.content.strip().lower() == "/drop":
+                await self._handle_drop(msg)
             else:
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(msg.session_key, []).append(task)
@@ -292,6 +294,29 @@ class AgentLoop:
         sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
         total = cancelled + sub_cancelled
         content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id, content=content,
+        ))
+
+    async def _handle_drop(self, msg: InboundMessage) -> None:
+        """Cancel active tasks and remove the last conversation turn from the session."""
+        # Cancel any in-progress tasks first (same logic as /stop)
+        tasks = self._active_tasks.pop(msg.session_key, [])
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        await self.subagents.cancel_by_session(msg.session_key)
+
+        # Drop the last turn from persistent session history
+        session = self.sessions.get_or_create(msg.session_key)
+        removed = session.drop_last_turn()
+        self.sessions.save(session)
+
+        content = f"🗑 Dropped last turn ({removed} message(s) removed)." if removed else "Nothing to drop."
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content,
         ))
@@ -396,7 +421,7 @@ class AgentLoop:
                                   content="New session started.")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/model — List or switch the AI model\n/stop — Stop the current task\n/help — Show available commands")
+                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/drop — Remove the last conversation turn\n/model — List or switch the AI model\n/stop — Stop the current task\n/help — Show available commands")
 
         # /model command — not saved to context
         content_raw = msg.content.strip()
