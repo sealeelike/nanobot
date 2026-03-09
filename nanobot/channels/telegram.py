@@ -810,10 +810,7 @@ class TelegramChannel(BaseChannel):
         # already gave lightweight feedback via answerCallbackQuery above.
         inbound_meta = dict(pending.get("inbound_metadata") or {})
         inbound_meta["_suppress_tg_response"] = True
-        # Reconstruct session_key_override from skey for topic-scoped sessions.
-        session_key_override = pending.get("session_key") or (
-            skey if "topic" in skey else None
-        )
+        session_key_override = pending.get("session_key")
         await self._handle_message(
             sender_id=pending.get("sender_id", ""),
             chat_id=chat_id,

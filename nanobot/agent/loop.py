@@ -45,6 +45,9 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 500
+    # Tools whose side effects are fully reversible (write_file, edit_file).
+    # read_file and list_dir produce no side effects and are therefore transparent.
+    _REVERSIBLE_TOOLS: frozenset[str] = frozenset({"write_file", "edit_file", "read_file", "list_dir"})
 
     def __init__(
         self,
@@ -324,7 +327,7 @@ class AgentLoop:
         for m in last_turn_msgs:
             for tc in m.get("tool_calls") or []:
                 tool_name = tc.get("function", {}).get("name", "")
-                if tool_name and tool_name not in {"write_file", "edit_file", "read_file", "list_dir"}:
+                if tool_name and tool_name not in self._REVERSIBLE_TOOLS:
                     non_reversible.add(tool_name)
 
         reversible_actions: list[str] = []
@@ -392,7 +395,7 @@ class AgentLoop:
         for m in last_turn_msgs:
             for tc in m.get("tool_calls") or []:
                 tool_name = tc.get("function", {}).get("name", "")
-                if tool_name and tool_name not in {"write_file", "edit_file", "read_file", "list_dir"}:
+                if tool_name and tool_name not in self._REVERSIBLE_TOOLS:
                     non_reversible.add(tool_name)
 
         # Revert reversible tool actions in reverse order

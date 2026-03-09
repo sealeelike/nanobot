@@ -1380,9 +1380,10 @@ class TestTelegramUndoConfirmationUI:
         ))
 
         text = channel._app.bot.sent_messages[0]["text"]
-        assert "edit_file memory/MEMORY.md" in text
-        assert "write_file workspace/USER.md" in text
-        assert "exec" in text  # non-reversible tool mentioned
+        assert "• edit_file memory/MEMORY.md" in text
+        assert "• write_file workspace/USER.md" in text
+        assert "exec" in text  # non-reversible tool mentioned with "(not reversible)"
+        assert "(not reversible)" in text
         assert "1 user message" in text
         assert "1 nanobot message" in text
 
