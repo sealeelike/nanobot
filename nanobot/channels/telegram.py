@@ -186,9 +186,10 @@ class TelegramChannel(BaseChannel):
         self._media_group_tasks: dict[str, asyncio.Task] = {}
         self._message_threads: dict[tuple[str, int], int] = {}
         self._session_current_model: dict[str, str] = {}  # session key → active model
-        # Per-session turn tracking for /undo message deletion
-        self._session_turn_user_msg_id: dict[str, int] = {}   # session_key → last user msg_id
-        self._session_turn_bot_msg_ids: dict[str, list[int]] = {}  # session_key → bot msg_ids
+        # Per-session turn stack for /undo message deletion.
+        # Each entry is {"user_msg_id": int|None, "bot_msg_ids": list[int]}.
+        # New turns are appended; successful /undo pops the last entry.
+        self._session_turn_stack: dict[str, list[dict]] = {}
 
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
@@ -387,8 +388,9 @@ class TelegramChannel(BaseChannel):
                             f"telegram:{msg.chat_id}:topic:{thread_id}"
                             if thread_id else f"telegram:{msg.chat_id}"
                         )
-                        if skey in self._session_turn_bot_msg_ids:
-                            self._session_turn_bot_msg_ids[skey].append(sent.message_id)
+                        stack = self._session_turn_stack.get(skey)
+                        if stack:
+                            stack[-1]["bot_msg_ids"].append(sent.message_id)
                 else:
                     await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
 
@@ -415,9 +417,12 @@ class TelegramChannel(BaseChannel):
                     )
                 except Exception as e:
                     logger.debug("Could not delete bot message {}: {}", bot_msg_id, e)
-            # Clear stale tracking for this session now that the turn was undone.
-            self._session_turn_user_msg_id.pop(skey, None)
-            self._session_turn_bot_msg_ids.pop(skey, None)
+            # Pop the undone turn from the stack; discard empty stacks.
+            stack = self._session_turn_stack.get(skey)
+            if stack:
+                stack.pop()
+                if not stack:
+                    del self._session_turn_stack[skey]
 
     async def _send_text(
         self,
@@ -646,16 +651,17 @@ class TelegramChannel(BaseChannel):
         except Exception:
             pass
 
-        # Read tracked IDs but do NOT pop them yet.  We only delete prior-turn messages after
-        # the backend confirms the undo succeeded; we pass the IDs forward in metadata so that
-        # send() can perform the deletion once it sees _undo_succeeded=True.
+        # Read the top of the turn stack but do NOT pop it yet.  We only delete prior-turn
+        # messages after the backend confirms the undo succeeded; we pass the IDs forward in
+        # metadata so that send() can perform the deletion once it sees _undo_succeeded=True.
         meta = self._build_message_metadata(message, user)
-        user_msg_id = self._session_turn_user_msg_id.get(skey)
-        bot_msg_ids = list(self._session_turn_bot_msg_ids.get(skey, []))
-        if user_msg_id is not None:
-            meta["_undo_candidate_user_msg_id"] = user_msg_id
-        if bot_msg_ids:
-            meta["_undo_candidate_bot_msg_ids"] = bot_msg_ids
+        stack = self._session_turn_stack.get(skey, [])
+        if stack:
+            top = stack[-1]
+            if top.get("user_msg_id") is not None:
+                meta["_undo_candidate_user_msg_id"] = top["user_msg_id"]
+            if top.get("bot_msg_ids"):
+                meta["_undo_candidate_bot_msg_ids"] = list(top["bot_msg_ids"])
 
         # Forward /undo to AgentLoop via bus
         await self._handle_message(
@@ -801,10 +807,11 @@ class TelegramChannel(BaseChannel):
         metadata = self._build_message_metadata(message, user)
         session_key = self._derive_topic_session_key(message)
 
-        # Track this user message for /undo message deletion
+        # Track this user message for /undo message deletion — push a new turn record.
         skey = session_key or f"telegram:{str_chat_id}"
-        self._session_turn_user_msg_id[skey] = message.message_id
-        self._session_turn_bot_msg_ids[skey] = []  # Reset bot IDs for the new turn
+        if skey not in self._session_turn_stack:
+            self._session_turn_stack[skey] = []
+        self._session_turn_stack[skey].append({"user_msg_id": message.message_id, "bot_msg_ids": []})
 
         # Telegram media groups: buffer briefly, forward as one aggregated turn.
         if media_group_id := getattr(message, "media_group_id", None):

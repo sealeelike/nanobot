@@ -974,8 +974,7 @@ class TestTelegramUndoCommand:
         """_on_undo_command must NOT delete prior-turn messages before the backend responds."""
         channel = _make_telegram_channel()
         skey = "telegram:123"
-        channel._session_turn_user_msg_id[skey] = 10
-        channel._session_turn_bot_msg_ids[skey] = [20, 21]
+        channel._session_turn_stack[skey] = [{"user_msg_id": 10, "bot_msg_ids": [20, 21]}]
 
         forwarded: list[dict] = []
 
@@ -1010,11 +1009,10 @@ class TestTelegramUndoCommand:
 
     @pytest.mark.asyncio
     async def test_undo_command_tracking_still_present_after_forwarding(self):
-        """Tracking dicts are NOT cleared by _on_undo_command — only by send() on confirmation."""
+        """Turn stack is NOT cleared by _on_undo_command — only by send() on confirmation."""
         channel = _make_telegram_channel()
         skey = "telegram:123"
-        channel._session_turn_user_msg_id[skey] = 10
-        channel._session_turn_bot_msg_ids[skey] = [20]
+        channel._session_turn_stack[skey] = [{"user_msg_id": 10, "bot_msg_ids": [20]}]
 
         async def _noop(**kwargs):
             pass
@@ -1033,17 +1031,18 @@ class TestTelegramUndoCommand:
 
         await channel._on_undo_command(fake_update, SimpleNamespace())
 
-        # Tracking dicts are still present — they'll be cleared by send() after confirmation.
-        assert channel._session_turn_user_msg_id.get(skey) == 10
-        assert channel._session_turn_bot_msg_ids.get(skey) == [20]
+        # Turn stack is still present — it'll be popped by send() after confirmation.
+        stack = channel._session_turn_stack.get(skey, [])
+        assert len(stack) == 1
+        assert stack[0]["user_msg_id"] == 10
+        assert stack[0]["bot_msg_ids"] == [20]
 
     @pytest.mark.asyncio
     async def test_send_deletes_tracked_messages_on_undo_success(self):
         """send() deletes prior-turn messages when _undo_succeeded=True."""
         channel = _make_telegram_channel()
         skey = "telegram:123"
-        channel._session_turn_user_msg_id[skey] = 10
-        channel._session_turn_bot_msg_ids[skey] = [20, 21]
+        channel._session_turn_stack[skey] = [{"user_msg_id": 10, "bot_msg_ids": [20, 21]}]
 
         await channel.send(OutboundMessage(
             channel="telegram",
@@ -1060,17 +1059,15 @@ class TestTelegramUndoCommand:
         assert 10 in deleted_ids   # user message deleted
         assert 20 in deleted_ids   # bot message 1 deleted
         assert 21 in deleted_ids   # bot message 2 deleted
-        # Tracking cleared after successful undo
-        assert skey not in channel._session_turn_user_msg_id
-        assert skey not in channel._session_turn_bot_msg_ids
+        # Stack entry popped after successful undo; stack is now empty / removed
+        assert not channel._session_turn_stack.get(skey)
 
     @pytest.mark.asyncio
     async def test_send_does_not_delete_on_nothing_to_undo(self):
         """send() must not delete prior-turn messages when undo found nothing to undo."""
         channel = _make_telegram_channel()
         skey = "telegram:123"
-        channel._session_turn_user_msg_id[skey] = 10
-        channel._session_turn_bot_msg_ids[skey] = [20]
+        channel._session_turn_stack[skey] = [{"user_msg_id": 10, "bot_msg_ids": [20]}]
 
         await channel.send(OutboundMessage(
             channel="telegram",
@@ -1086,8 +1083,10 @@ class TestTelegramUndoCommand:
         deleted_ids = {msg_id for _, msg_id in channel._app.bot.deleted_messages}
         assert 10 not in deleted_ids
         assert 20 not in deleted_ids
-        # Tracking dicts remain unchanged
-        assert channel._session_turn_user_msg_id.get(skey) == 10
+        # Stack must remain unchanged
+        stack = channel._session_turn_stack.get(skey, [])
+        assert len(stack) == 1
+        assert stack[0]["user_msg_id"] == 10
 
     @pytest.mark.asyncio
     async def test_undo_command_safe_when_no_prior_turn(self):
@@ -1149,9 +1148,8 @@ class TestTelegramUndoCommand:
         """send() tracks non-progress bot message IDs for /undo."""
         channel = _make_telegram_channel()
         skey = "telegram:123"
-        # Simulate a prior user message establishing the tracking dict
-        channel._session_turn_user_msg_id[skey] = 1
-        channel._session_turn_bot_msg_ids[skey] = []
+        # Simulate a prior user message establishing the turn stack entry
+        channel._session_turn_stack[skey] = [{"user_msg_id": 1, "bot_msg_ids": []}]
 
         await channel.send(OutboundMessage(
             channel="telegram",
@@ -1160,15 +1158,16 @@ class TestTelegramUndoCommand:
             metadata={},
         ))
 
-        assert len(channel._session_turn_bot_msg_ids[skey]) == 1
+        stack = channel._session_turn_stack.get(skey, [])
+        assert len(stack) == 1
+        assert len(stack[-1]["bot_msg_ids"]) == 1
 
     @pytest.mark.asyncio
     async def test_send_does_not_track_progress_messages(self):
         """send() does NOT track progress (typing) messages."""
         channel = _make_telegram_channel()
         skey = "telegram:123"
-        channel._session_turn_user_msg_id[skey] = 1
-        channel._session_turn_bot_msg_ids[skey] = []
+        channel._session_turn_stack[skey] = [{"user_msg_id": 1, "bot_msg_ids": []}]
 
         await channel.send(OutboundMessage(
             channel="telegram",
@@ -1177,22 +1176,146 @@ class TestTelegramUndoCommand:
             metadata={"_progress": True},
         ))
 
-        assert channel._session_turn_bot_msg_ids[skey] == []
+        stack = channel._session_turn_stack.get(skey, [])
+        assert stack and stack[-1]["bot_msg_ids"] == []
 
     @pytest.mark.asyncio
-    async def test_on_message_resets_bot_tracking_for_new_turn(self):
-        """_on_message resets bot message ID tracking for each new user turn."""
+    async def test_on_message_pushes_new_turn_to_stack(self):
+        """Each new user message pushes a fresh turn record onto the stack."""
         channel = _make_telegram_channel()
         skey = "telegram:123"
-        # Pre-populate from a previous turn
-        channel._session_turn_user_msg_id[skey] = 5
-        channel._session_turn_bot_msg_ids[skey] = [10, 11]
+        # Pre-populate with a previous turn
+        channel._session_turn_stack[skey] = [{"user_msg_id": 5, "bot_msg_ids": [10, 11]}]
 
-        # Simulate a new incoming message (call the relevant tracking lines directly)
-        str_chat_id = "123"
+        # Simulate the tracking lines that _on_message executes
         new_user_msg_id = 20
-        channel._session_turn_user_msg_id[skey] = new_user_msg_id
-        channel._session_turn_bot_msg_ids[skey] = []
+        if skey not in channel._session_turn_stack:
+            channel._session_turn_stack[skey] = []
+        channel._session_turn_stack[skey].append({"user_msg_id": new_user_msg_id, "bot_msg_ids": []})
 
-        assert channel._session_turn_user_msg_id[skey] == 20
-        assert channel._session_turn_bot_msg_ids[skey] == []
+        stack = channel._session_turn_stack[skey]
+        assert len(stack) == 2
+        assert stack[-1]["user_msg_id"] == 20
+        assert stack[-1]["bot_msg_ids"] == []
+        # Older turn is preserved
+        assert stack[0]["user_msg_id"] == 5
+
+    @pytest.mark.asyncio
+    async def test_single_undo_removes_one_turns_bubbles(self):
+        """A single /undo removes only the latest turn's message bubbles."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        # Two turns in the stack
+        channel._session_turn_stack[skey] = [
+            {"user_msg_id": 1, "bot_msg_ids": [2, 3]},    # turn 1 (older)
+            {"user_msg_id": 10, "bot_msg_ids": [20, 21]},  # turn 2 (latest)
+        ]
+
+        # Simulate send() receiving _undo_succeeded for turn 2
+        await channel.send(OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="↩️ Undid last turn",
+            metadata={
+                "_undo_succeeded": True,
+                "_undo_candidate_user_msg_id": 10,
+                "_undo_candidate_bot_msg_ids": [20, 21],
+            },
+        ))
+
+        deleted_ids = {msg_id for _, msg_id in channel._app.bot.deleted_messages}
+        # Turn 2 bubbles deleted
+        assert 10 in deleted_ids
+        assert 20 in deleted_ids
+        assert 21 in deleted_ids
+        # Turn 1 bubbles NOT deleted
+        assert 1 not in deleted_ids
+        assert 2 not in deleted_ids
+        assert 3 not in deleted_ids
+
+        # Stack still has turn 1
+        stack = channel._session_turn_stack.get(skey, [])
+        assert len(stack) == 1
+        assert stack[0]["user_msg_id"] == 1
+
+    @pytest.mark.asyncio
+    async def test_two_consecutive_undos_remove_two_turns_bubbles(self):
+        """Two consecutive /undos each remove the correct turn's message bubbles."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_stack[skey] = [
+            {"user_msg_id": 1, "bot_msg_ids": [2, 3]},    # turn 1 (older)
+            {"user_msg_id": 10, "bot_msg_ids": [20, 21]},  # turn 2 (latest)
+        ]
+
+        # First undo — removes turn 2
+        await channel.send(OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="↩️ Undid last turn",
+            metadata={
+                "_undo_succeeded": True,
+                "_undo_candidate_user_msg_id": 10,
+                "_undo_candidate_bot_msg_ids": [20, 21],
+            },
+        ))
+
+        deleted_after_first = {msg_id for _, msg_id in channel._app.bot.deleted_messages}
+        assert 10 in deleted_after_first
+        assert 20 in deleted_after_first
+        assert 21 in deleted_after_first
+        assert 1 not in deleted_after_first  # turn 1 still present
+
+        # Stack now has only turn 1
+        assert len(channel._session_turn_stack.get(skey, [])) == 1
+
+        # Second undo — removes turn 1
+        await channel.send(OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="↩️ Undid last turn",
+            metadata={
+                "_undo_succeeded": True,
+                "_undo_candidate_user_msg_id": 1,
+                "_undo_candidate_bot_msg_ids": [2, 3],
+            },
+        ))
+
+        deleted_after_second = {msg_id for _, msg_id in channel._app.bot.deleted_messages}
+        assert 1 in deleted_after_second
+        assert 2 in deleted_after_second
+        assert 3 in deleted_after_second
+
+        # Stack is now empty
+        assert not channel._session_turn_stack.get(skey)
+
+    @pytest.mark.asyncio
+    async def test_nothing_to_undo_does_not_pop_stack(self):
+        """When backend returns 'Nothing to undo.', the turn stack is left unchanged."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_stack[skey] = [
+            {"user_msg_id": 5, "bot_msg_ids": [50]},
+        ]
+
+        await channel.send(OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="Nothing to undo.",
+            metadata={
+                "_undo_candidate_user_msg_id": 5,
+                "_undo_candidate_bot_msg_ids": [50],
+                # No _undo_succeeded
+            },
+        ))
+
+        deleted_ids = {msg_id for _, msg_id in channel._app.bot.deleted_messages}
+        assert 5 not in deleted_ids
+        assert 50 not in deleted_ids
+
+        # Stack must be unchanged
+        stack = channel._session_turn_stack.get(skey, [])
+        assert len(stack) == 1
+        assert stack[0]["user_msg_id"] == 5
+
+
