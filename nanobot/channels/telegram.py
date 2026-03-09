@@ -405,14 +405,6 @@ class TelegramChannel(BaseChannel):
                         stack = self._session_turn_stack.get(skey)
                         if stack:
                             stack[-1]["bot_msg_ids"].append(sent.message_id)
-                            logger.debug(
-                                "UNDO_DIAG track_bot | skey={} bot_msg_id={} turn_user_msg_id={}"
-                                " bot_msg_ids={} stack_depth={}",
-                                skey, sent.message_id, stack[-1].get("user_msg_id"),
-                                stack[-1]["bot_msg_ids"], len(stack),
-                            )
-                else:
-                    await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
 
         # Legacy path: handle the old _undo_succeeded signal (for non-Telegram CLI flows).
         if msg.metadata.get("_undo_succeeded"):
@@ -424,42 +416,24 @@ class TelegramChannel(BaseChannel):
             chat_id_int = int(msg.chat_id)
             user_msg_id = msg.metadata.get("_undo_candidate_user_msg_id")
             if user_msg_id is not None:
-                kind = "user"
                 try:
-                    logger.debug(
-                        "UNDO_DIAG delete_attempt | kind={} chat_id={} message_id={}",
-                        kind, chat_id_int, user_msg_id,
-                    )
                     await self._app.bot.delete_message(
                         chat_id=chat_id_int, message_id=user_msg_id
                     )
-                    logger.debug(
-                        "UNDO_DIAG delete_ok | kind={} chat_id={} message_id={}",
-                        kind, chat_id_int, user_msg_id,
-                    )
                 except Exception as e:
                     logger.warning(
-                        "UNDO_DIAG delete_fail | kind={} chat_id={} message_id={} error={}",
-                        kind, chat_id_int, user_msg_id, e,
+                        "Failed to delete user message {} in chat {}: {}",
+                        user_msg_id, chat_id_int, e,
                     )
             for bot_msg_id in msg.metadata.get("_undo_candidate_bot_msg_ids", []):
-                kind = "bot"
                 try:
-                    logger.debug(
-                        "UNDO_DIAG delete_attempt | kind={} chat_id={} message_id={}",
-                        kind, chat_id_int, bot_msg_id,
-                    )
                     await self._app.bot.delete_message(
                         chat_id=chat_id_int, message_id=bot_msg_id
                     )
-                    logger.debug(
-                        "UNDO_DIAG delete_ok | kind={} chat_id={} message_id={}",
-                        kind, chat_id_int, bot_msg_id,
-                    )
                 except Exception as e:
                     logger.warning(
-                        "UNDO_DIAG delete_fail | kind={} chat_id={} message_id={} error={}",
-                        kind, chat_id_int, bot_msg_id, e,
+                        "Failed to delete bot message {} in chat {}: {}",
+                        bot_msg_id, chat_id_int, e,
                     )
             # Pop the undone turn from the stack; discard empty stacks.
             stack = self._session_turn_stack.get(skey)
@@ -483,35 +457,20 @@ class TelegramChannel(BaseChannel):
 
         # Retrieve and clear the pending state regardless of outcome.
         pending = self._pending_undo.pop(skey, None)
-        logger.debug(
-            "UNDO_DIAG result_recv | skey={} status={} pending={} stack={}",
-            skey, status,
-            {k: v for k, v in pending.items() if k != "inbound_metadata"} if pending else None,
-            self._compact_stack(skey),
-        )
 
         # Always delete the confirmation keyboard message.
         if pending is not None:
             confirmation_msg_id = pending.get("confirmation_msg_id")
             chat_id_int = int(pending["chat_id"])
             if confirmation_msg_id:
-                kind = "confirmation"
                 try:
-                    logger.debug(
-                        "UNDO_DIAG delete_attempt | kind={} chat_id={} message_id={}",
-                        kind, chat_id_int, confirmation_msg_id,
-                    )
                     await self._app.bot.delete_message(
                         chat_id=chat_id_int, message_id=confirmation_msg_id
                     )
-                    logger.debug(
-                        "UNDO_DIAG delete_ok | kind={} chat_id={} message_id={}",
-                        kind, chat_id_int, confirmation_msg_id,
-                    )
                 except Exception as e:
                     logger.warning(
-                        "UNDO_DIAG delete_fail | kind={} chat_id={} message_id={} error={}",
-                        kind, chat_id_int, confirmation_msg_id, e,
+                        "Failed to delete confirmation message {} in chat {}: {}",
+                        confirmation_msg_id, chat_id_int, e,
                     )
 
         if status == "success" and pending is not None:
@@ -519,42 +478,24 @@ class TelegramChannel(BaseChannel):
             # Delete the tracked user/bot message bubbles for the undone turn.
             user_msg_id = pending.get("user_msg_id")
             if user_msg_id is not None:
-                kind = "user"
                 try:
-                    logger.debug(
-                        "UNDO_DIAG delete_attempt | kind={} chat_id={} message_id={}",
-                        kind, chat_id_int, user_msg_id,
-                    )
                     await self._app.bot.delete_message(
                         chat_id=chat_id_int, message_id=user_msg_id
                     )
-                    logger.debug(
-                        "UNDO_DIAG delete_ok | kind={} chat_id={} message_id={}",
-                        kind, chat_id_int, user_msg_id,
-                    )
                 except Exception as e:
                     logger.warning(
-                        "UNDO_DIAG delete_fail | kind={} chat_id={} message_id={} error={}",
-                        kind, chat_id_int, user_msg_id, e,
+                        "Failed to delete user message {} in chat {}: {}",
+                        user_msg_id, chat_id_int, e,
                     )
             for bot_msg_id in pending.get("bot_msg_ids", []):
-                kind = "bot"
                 try:
-                    logger.debug(
-                        "UNDO_DIAG delete_attempt | kind={} chat_id={} message_id={}",
-                        kind, chat_id_int, bot_msg_id,
-                    )
                     await self._app.bot.delete_message(
                         chat_id=chat_id_int, message_id=bot_msg_id
                     )
-                    logger.debug(
-                        "UNDO_DIAG delete_ok | kind={} chat_id={} message_id={}",
-                        kind, chat_id_int, bot_msg_id,
-                    )
                 except Exception as e:
                     logger.warning(
-                        "UNDO_DIAG delete_fail | kind={} chat_id={} message_id={} error={}",
-                        kind, chat_id_int, bot_msg_id, e,
+                        "Failed to delete bot message {} in chat {}: {}",
+                        bot_msg_id, chat_id_int, e,
                     )
 
             # Pop the undone turn from the local turn stack.
@@ -563,7 +504,6 @@ class TelegramChannel(BaseChannel):
                 stack.pop()
                 if not stack:
                     del self._session_turn_stack[skey]
-            logger.debug("UNDO_DIAG cleanup_done | skey={} stack={}", skey, self._compact_stack(skey))
 
     async def _send_text(
         self,
@@ -861,12 +801,6 @@ class TelegramChannel(BaseChannel):
                 else str(msg.metadata.get("user_id", ""))
             ),
         }
-        logger.debug(
-            "UNDO_DIAG snapshot | skey={} turn_start_index={} user_msg_id={} bot_msg_ids={}"
-            " stack_depth={} stack={}",
-            skey, plan.get("turn_start_index"), top.get("user_msg_id"),
-            list(top.get("bot_msg_ids", [])), len(stack), self._compact_stack(skey),
-        )
 
     async def _on_undo_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle inline keyboard button press for undo confirmation."""
@@ -912,12 +846,6 @@ class TelegramChannel(BaseChannel):
         # Pass the skey back so send() can look up the pending state.
         inbound_meta["_pending_skey"] = skey
 
-        logger.debug(
-            "UNDO_DIAG confirm_fwd | skey={} turn_start_index={} pending={}",
-            skey, turn_start_index,
-            {k: v for k, v in pending.items() if k != "inbound_metadata"},
-        )
-
         await self._handle_message(
             sender_id=pending.get("sender_id", ""),
             chat_id=chat_id,
@@ -954,7 +882,6 @@ class TelegramChannel(BaseChannel):
         self._remember_thread_context(message)
         chat_id = str(message.chat_id)
         session_key = self._derive_topic_session_key(message)
-        skey = session_key or f"telegram:{chat_id}"
 
         # Delete the /undo command message itself (always safe).
         try:
@@ -1013,11 +940,6 @@ class TelegramChannel(BaseChannel):
         self._message_threads[key] = message_thread_id
         if len(self._message_threads) > 1000:
             self._message_threads.pop(next(iter(self._message_threads)))
-
-    def _compact_stack(self, skey: str) -> list[dict]:
-        """Return a compact representation of the turn stack for diagnostic logging."""
-        stack = self._session_turn_stack.get(skey, [])
-        return [{"u": t.get("user_msg_id"), "b": t.get("bot_msg_ids", [])} for t in stack]
 
     async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Forward slash commands to the bus for unified handling in AgentLoop."""
@@ -1122,11 +1044,6 @@ class TelegramChannel(BaseChannel):
         if skey not in self._session_turn_stack:
             self._session_turn_stack[skey] = []
         self._session_turn_stack[skey].append({"user_msg_id": message.message_id, "bot_msg_ids": []})
-        logger.debug(
-            "UNDO_DIAG new_turn | skey={} user_msg_id={} stack_depth={} stack={}",
-            skey, message.message_id, len(self._session_turn_stack[skey]),
-            self._compact_stack(skey),
-        )
 
         # Telegram media groups: buffer briefly, forward as one aggregated turn.
         if media_group_id := getattr(message, "media_group_id", None):
