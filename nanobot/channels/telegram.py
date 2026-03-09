@@ -405,6 +405,27 @@ class TelegramChannel(BaseChannel):
                         stack = self._session_turn_stack.get(skey)
                         if stack:
                             stack[-1]["bot_msg_ids"].append(sent.message_id)
+                            if self.config.debug_undo:
+                                logger.debug(
+                                    "[undo-debug] bot_msg appended skey={} msg_id={} bot_msg_ids={}",
+                                    skey, sent.message_id, stack[-1]["bot_msg_ids"],
+                                )
+                            # Keep the pending-undo snapshot in sync: if
+                            # _show_undo_confirmation() was called before all bot
+                            # messages for this turn were sent, late-arriving IDs
+                            # must be added to the snapshot so that undo deletes them.
+                            pending = self._pending_undo.get(skey)
+                            if (
+                                pending is not None
+                                and pending.get("user_msg_id") == stack[-1].get("user_msg_id")
+                                and sent.message_id not in pending["bot_msg_ids"]
+                            ):
+                                pending["bot_msg_ids"].append(sent.message_id)
+                                if self.config.debug_undo:
+                                    logger.debug(
+                                        "[undo-debug] pending snapshot synced skey={} added={}",
+                                        skey, sent.message_id,
+                                    )
                 else:
                     await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
 
@@ -453,15 +474,30 @@ class TelegramChannel(BaseChannel):
         # Retrieve and clear the pending state regardless of outcome.
         pending = self._pending_undo.pop(skey, None)
 
+        if self.config.debug_undo:
+            logger.debug(
+                "[undo-debug] _handle_undo_result skey={} status={} pending={}",
+                skey, status, pending,
+            )
+
         # Always delete the confirmation keyboard message.
         if pending is not None:
             confirmation_msg_id = pending.get("confirmation_msg_id")
             chat_id_int = int(pending["chat_id"])
             if confirmation_msg_id:
+                if self.config.debug_undo:
+                    logger.debug(
+                        "[undo-debug] delete confirmation chat_id={} msg_id={}",
+                        chat_id_int, confirmation_msg_id,
+                    )
                 try:
                     await self._app.bot.delete_message(
                         chat_id=chat_id_int, message_id=confirmation_msg_id
                     )
+                    if self.config.debug_undo:
+                        logger.debug(
+                            "[undo-debug] deleted confirmation msg_id={} ok", confirmation_msg_id,
+                        )
                 except Exception as e:
                     logger.debug("Could not delete undo confirmation message {}: {}", confirmation_msg_id, e)
 
@@ -470,19 +506,39 @@ class TelegramChannel(BaseChannel):
             # Delete the tracked user/bot message bubbles for the undone turn.
             user_msg_id = pending.get("user_msg_id")
             if user_msg_id is not None:
+                if self.config.debug_undo:
+                    logger.debug(
+                        "[undo-debug] delete user msg chat_id={} msg_id={}",
+                        chat_id_int, user_msg_id,
+                    )
                 try:
                     await self._app.bot.delete_message(
                         chat_id=chat_id_int, message_id=user_msg_id
                     )
+                    if self.config.debug_undo:
+                        logger.debug("[undo-debug] deleted user msg_id={} ok", user_msg_id)
                 except Exception as e:
-                    logger.debug("Could not delete user message {}: {}", user_msg_id, e)
+                    logger.warning(
+                        "Could not delete user message chat_id={} msg_id={}: {}",
+                        chat_id_int, user_msg_id, e,
+                    )
             for bot_msg_id in pending.get("bot_msg_ids", []):
+                if self.config.debug_undo:
+                    logger.debug(
+                        "[undo-debug] delete bot msg chat_id={} msg_id={}",
+                        chat_id_int, bot_msg_id,
+                    )
                 try:
                     await self._app.bot.delete_message(
                         chat_id=chat_id_int, message_id=bot_msg_id
                     )
+                    if self.config.debug_undo:
+                        logger.debug("[undo-debug] deleted bot msg_id={} ok", bot_msg_id)
                 except Exception as e:
-                    logger.debug("Could not delete bot message {}: {}", bot_msg_id, e)
+                    logger.warning(
+                        "Could not delete bot message chat_id={} msg_id={}: {}",
+                        chat_id_int, bot_msg_id, e,
+                    )
 
             # Pop the undone turn from the local turn stack.
             stack = self._session_turn_stack.get(skey)
@@ -788,6 +844,17 @@ class TelegramChannel(BaseChannel):
             ),
         }
 
+        if self.config.debug_undo:
+            logger.debug(
+                "[undo-debug] _show_undo_confirmation snapshot skey={} turn_start_index={}"
+                " user_msg_id={} bot_msg_ids={} stack_depth={}",
+                skey,
+                plan.get("turn_start_index"),
+                top.get("user_msg_id"),
+                list(top.get("bot_msg_ids", [])),
+                len(stack),
+            )
+
     async def _on_undo_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle inline keyboard button press for undo confirmation."""
         query = update.callback_query
@@ -824,6 +891,12 @@ class TelegramChannel(BaseChannel):
         turn_start_index = pending.get("turn_start_index")
         chat_id = pending["chat_id"]
         session_key_override = pending.get("session_key")
+
+        if self.config.debug_undo:
+            logger.debug(
+                "[undo-debug] _handle_undo_confirm skey={} turn_start_index={}",
+                skey, turn_start_index,
+            )
 
         # Forward the apply request to AgentLoop.  The backend will verify that the
         # session's current last turn still matches turn_start_index before executing.
@@ -1031,6 +1104,12 @@ class TelegramChannel(BaseChannel):
         if skey not in self._session_turn_stack:
             self._session_turn_stack[skey] = []
         self._session_turn_stack[skey].append({"user_msg_id": message.message_id, "bot_msg_ids": []})
+
+        if self.config.debug_undo:
+            logger.debug(
+                "[undo-debug] new turn pushed skey={} user_msg_id={} stack_depth={}",
+                skey, message.message_id, len(self._session_turn_stack[skey]),
+            )
 
         # Telegram media groups: buffer briefly, forward as one aggregated turn.
         if media_group_id := getattr(message, "media_group_id", None):

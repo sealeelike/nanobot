@@ -2267,3 +2267,276 @@ class TestTelegramUndoConfirmationUI:
         assert pending.get("turn_start_index") == 4
 
 
+# ---------------------------------------------------------------------------
+# Undo race-condition / multi-bubble tests
+# ---------------------------------------------------------------------------
+
+class TestTelegramUndoMultiBubble:
+    """Tests for multi-bot-message turns and the pending-snapshot sync fix."""
+
+    @pytest.mark.asyncio
+    async def test_undo_deletes_all_two_bot_messages_from_one_turn(self):
+        """One user turn producing two bot messages: undo deletes both via _undo_result."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 1, "bot_msg_ids": []}]
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "session_key": None,
+            "skey": skey,
+            "turn_start_index": 0,
+            "confirmation_msg_id": 99,
+            "user_msg_id": 1,
+            "bot_msg_ids": [10, 11],  # both bot messages already snapshotted
+            "message_thread_id": None,
+            "inbound_metadata": {},
+            "sender_id": "",
+        }
+
+        await channel.send(OutboundMessage(
+            channel="telegram", chat_id="123", content="",
+            metadata={
+                "_undo_result": {"status": "success", "turn_start_index": 0},
+                "_pending_skey": skey,
+            },
+        ))
+
+        deleted_ids = {mid for _, mid in channel._app.bot.deleted_messages}
+        assert 1 in deleted_ids   # user message
+        assert 10 in deleted_ids  # first bot message
+        assert 11 in deleted_ids  # second bot message
+        assert 99 in deleted_ids  # confirmation
+
+    @pytest.mark.asyncio
+    async def test_pending_snapshot_synced_when_bot_message_arrives_late(self):
+        """When a bot message is sent after _show_undo_confirmation snapshots, it is added to the snapshot."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        # Simulate: snapshot was taken with only first bot message; second arrives after
+        channel._session_turn_stack[skey] = [{"user_msg_id": 1, "bot_msg_ids": [10]}]
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "session_key": None,
+            "skey": skey,
+            "turn_start_index": 0,
+            "confirmation_msg_id": 99,
+            "user_msg_id": 1,
+            "bot_msg_ids": [10],  # snapshot taken with only first bot message
+            "message_thread_id": None,
+            "inbound_metadata": {},
+            "sender_id": "",
+        }
+
+        # Second bot message arrives after snapshot was taken
+        await channel.send(OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="second response",
+            metadata={},
+        ))
+
+        # The snapshot should now include the newly sent message (id=1 from _FakeBot)
+        pending = channel._pending_undo.get(skey)
+        assert pending is not None
+        # FakeBot's send_message returns id = len(sent_messages), so the new message has id=1
+        new_msg_id = 1
+        assert new_msg_id in pending["bot_msg_ids"]
+
+    @pytest.mark.asyncio
+    async def test_pending_snapshot_not_updated_for_different_turn_user_msg(self):
+        """When pending undo is for a different user_msg_id, late bot messages are NOT added."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        # Stack has a newer turn (user_msg_id=2) than the pending undo (user_msg_id=1)
+        channel._session_turn_stack[skey] = [
+            {"user_msg_id": 1, "bot_msg_ids": [10]},
+            {"user_msg_id": 2, "bot_msg_ids": []},
+        ]
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "session_key": None,
+            "skey": skey,
+            "turn_start_index": 0,
+            "confirmation_msg_id": 99,
+            "user_msg_id": 1,
+            "bot_msg_ids": [10],
+            "message_thread_id": None,
+            "inbound_metadata": {},
+            "sender_id": "",
+        }
+
+        # Bot message for the new turn (user_msg_id=2)
+        await channel.send(OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="response for turn 2",
+            metadata={},
+        ))
+
+        # Pending snapshot must NOT include the message from the newer turn
+        pending = channel._pending_undo.get(skey)
+        assert pending is not None
+        assert pending["bot_msg_ids"] == [10]
+
+    @pytest.mark.asyncio
+    async def test_show_undo_confirmation_snapshot_includes_all_current_bot_ids(self):
+        """Pending undo snapshot captures all bot_msg_ids present at snapshot time."""
+        channel = _make_telegram_channel()
+        skey = "telegram:456"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 10, "bot_msg_ids": [20, 21, 22]}]
+
+        plan = {
+            "nothing": False,
+            "turn_start_index": 0,
+            "user_count": 1,
+            "assistant_count": 3,
+            "reversible_actions": [],
+            "non_reversible": [],
+        }
+        await channel._show_undo_confirmation(OutboundMessage(
+            channel="telegram", chat_id="456", content="",
+            metadata={"_undo_plan": plan},
+        ))
+
+        pending = channel._pending_undo.get(skey, {})
+        assert pending.get("bot_msg_ids") == [20, 21, 22]
+        assert pending.get("user_msg_id") == 10
+
+    @pytest.mark.asyncio
+    async def test_delete_failure_logged_at_warning(self):
+        """A delete_message failure for a bot message is logged at warning level (not debug)."""
+        from loguru import logger as _loguru_logger
+
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+
+        class _FailingBot(_FakeBot):
+            async def delete_message(self, chat_id, message_id) -> None:
+                if message_id == 20:
+                    raise Exception("Bad Request: message to delete not found")
+                await super().delete_message(chat_id, message_id)
+
+        channel._app.bot = _FailingBot()
+        channel._session_turn_stack[skey] = [{"user_msg_id": 10, "bot_msg_ids": [20]}]
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "session_key": None,
+            "skey": skey,
+            "turn_start_index": 0,
+            "confirmation_msg_id": 99,
+            "user_msg_id": None,
+            "bot_msg_ids": [20],
+            "message_thread_id": None,
+            "inbound_metadata": {},
+            "sender_id": "",
+        }
+
+        warning_records: list[str] = []
+
+        def _sink(message):
+            if message.record["level"].name == "WARNING":
+                warning_records.append(message.record["message"])
+
+        sink_id = _loguru_logger.add(_sink, level="WARNING")
+        try:
+            await channel.send(OutboundMessage(
+                channel="telegram", chat_id="123", content="",
+                metadata={
+                    "_undo_result": {"status": "success", "turn_start_index": 0},
+                    "_pending_skey": skey,
+                },
+            ))
+        finally:
+            _loguru_logger.remove(sink_id)
+
+        assert any("20" in r for r in warning_records), (
+            f"Expected warning mentioning msg_id 20, got: {warning_records}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_regression_single_message_turn(self):
+        """Single-message turns still work correctly with the sync fix in place."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_stack[skey] = [{"user_msg_id": 5, "bot_msg_ids": [50]}]
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "session_key": None,
+            "skey": skey,
+            "turn_start_index": 0,
+            "confirmation_msg_id": 99,
+            "user_msg_id": 5,
+            "bot_msg_ids": [50],
+            "message_thread_id": None,
+            "inbound_metadata": {},
+            "sender_id": "",
+        }
+
+        await channel.send(OutboundMessage(
+            channel="telegram", chat_id="123", content="",
+            metadata={
+                "_undo_result": {"status": "success", "turn_start_index": 0},
+                "_pending_skey": skey,
+            },
+        ))
+
+        deleted_ids = {mid for _, mid in channel._app.bot.deleted_messages}
+        assert 5 in deleted_ids   # user message
+        assert 50 in deleted_ids  # bot message
+        assert 99 in deleted_ids  # confirmation
+        assert not channel._session_turn_stack.get(skey)
+
+    @pytest.mark.asyncio
+    async def test_consecutive_undos_correct_with_multi_bubble_turns(self):
+        """Two consecutive /undos on two-bubble turns each delete all bubbles correctly."""
+        channel = _make_telegram_channel()
+        skey = "telegram:123"
+        channel._session_turn_stack[skey] = [
+            {"user_msg_id": 1, "bot_msg_ids": [10, 11]},   # turn 1
+            {"user_msg_id": 2, "bot_msg_ids": [20, 21]},   # turn 2
+        ]
+
+        # First undo — turn 2
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "session_key": None,
+            "skey": skey,
+            "turn_start_index": 2,
+            "confirmation_msg_id": 99,
+            "user_msg_id": 2,
+            "bot_msg_ids": [20, 21],
+            "message_thread_id": None,
+            "inbound_metadata": {},
+            "sender_id": "",
+        }
+        await channel.send(OutboundMessage(
+            channel="telegram", chat_id="123", content="",
+            metadata={"_undo_result": {"status": "success", "turn_start_index": 2}, "_pending_skey": skey},
+        ))
+        deleted_first = {mid for _, mid in channel._app.bot.deleted_messages}
+        assert 2 in deleted_first and 20 in deleted_first and 21 in deleted_first
+        assert 1 not in deleted_first and 10 not in deleted_first
+
+        # Second undo — turn 1
+        channel._app.bot.deleted_messages.clear()
+        channel._pending_undo[skey] = {
+            "chat_id": "123",
+            "session_key": None,
+            "skey": skey,
+            "turn_start_index": 0,
+            "confirmation_msg_id": 100,
+            "user_msg_id": 1,
+            "bot_msg_ids": [10, 11],
+            "message_thread_id": None,
+            "inbound_metadata": {},
+            "sender_id": "",
+        }
+        await channel.send(OutboundMessage(
+            channel="telegram", chat_id="123", content="",
+            metadata={"_undo_result": {"status": "success", "turn_start_index": 0}, "_pending_skey": skey},
+        ))
+        deleted_second = {mid for _, mid in channel._app.bot.deleted_messages}
+        assert 1 in deleted_second and 10 in deleted_second and 11 in deleted_second
+        assert not channel._session_turn_stack.get(skey)
+
+
