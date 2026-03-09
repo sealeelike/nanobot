@@ -442,8 +442,7 @@ class TelegramChannel(BaseChannel):
 
         Deletes bubbles and pops the turn stack only on confirmed success.
         On expired/nothing/error, deletes the confirmation keyboard only, leaving
-        conversation bubbles intact.  Uses answerCallbackQuery for all feedback —
-        no normal chat message bubbles are sent.
+        conversation bubbles intact.  No chat message bubbles are sent for any outcome.
         """
         result: dict = msg.metadata.get("_undo_result", {})
         skey: str = msg.metadata.get("_pending_skey", f"telegram:{msg.chat_id}")
@@ -453,16 +452,6 @@ class TelegramChannel(BaseChannel):
 
         # Retrieve and clear the pending state regardless of outcome.
         pending = self._pending_undo.pop(skey, None)
-        callback_query_id: str | None = (pending or {}).get("callback_query_id")
-
-        async def _answer(text: str) -> None:
-            if callback_query_id:
-                try:
-                    await self._app.bot.answer_callback_query(
-                        callback_query_id=callback_query_id, text=text
-                    )
-                except Exception as e:
-                    logger.debug("Could not answer callback query for undo ({}): {}", status, e)
 
         # Always delete the confirmation keyboard message.
         if pending is not None:
@@ -501,15 +490,6 @@ class TelegramChannel(BaseChannel):
                 stack.pop()
                 if not stack:
                     del self._session_turn_stack[skey]
-
-            # Lightweight banner via answerCallbackQuery — no chat bubble.
-            await _answer("↩️ Undid last turn")
-
-        elif status == "expired":
-            await _answer("⚠️ Undo expired")
-
-        elif status == "nothing":
-            await _answer("Nothing to undo.")
 
     async def _send_text(
         self,
@@ -836,11 +816,10 @@ class TelegramChannel(BaseChannel):
             await query.answer("Undo already processed or expired.")
             return
 
-        # Store the callback_query_id so _handle_undo_result can answer the callback
-        # with the final result text (e.g. "↩️ Undid last turn") after the backend responds.
-        # We do NOT answer the callback here — that happens in _handle_undo_result so the
-        # popup shows the actual outcome, not just a neutral ack.
-        pending["callback_query_id"] = query.id
+        # Acknowledge the callback immediately so Telegram removes the spinner without timeout.
+        # Final feedback (success / expired / nothing) is delivered by _handle_undo_result by
+        # deleting or editing the confirmation message — not via a late answerCallbackQuery.
+        await query.answer()
 
         turn_start_index = pending.get("turn_start_index")
         chat_id = pending["chat_id"]

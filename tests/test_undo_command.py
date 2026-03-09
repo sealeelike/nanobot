@@ -1583,8 +1583,8 @@ class TestTelegramUndoConfirmationUI:
         assert stack[0]["user_msg_id"] == 1
 
     @pytest.mark.asyncio
-    async def test_handle_undo_result_success_uses_callback_answer_not_chat_bubble(self):
-        """send() with _undo_result status=success uses answerCallbackQuery, not send_message."""
+    async def test_handle_undo_result_success_no_chat_bubble_no_callback_answer(self):
+        """send() with _undo_result status=success sends no chat bubble and no answerCallbackQuery."""
         channel = _make_telegram_channel()
         skey = "telegram:123"
         channel._session_turn_stack[skey] = [{"user_msg_id": 5, "bot_msg_ids": []}]
@@ -1599,7 +1599,6 @@ class TestTelegramUndoConfirmationUI:
             "message_thread_id": None,
             "inbound_metadata": {},
             "sender_id": "",
-            "callback_query_id": "cqid_success",
         }
 
         await channel.send(OutboundMessage(
@@ -1610,12 +1609,9 @@ class TestTelegramUndoConfirmationUI:
             },
         ))
 
-        # No chat bubble — feedback is via answerCallbackQuery only
+        # No chat bubble and no answerCallbackQuery — result is conveyed by message deletion
         assert len(channel._app.bot.sent_messages) == 0
-        answered = channel._app.bot.answered_callbacks
-        assert len(answered) == 1
-        assert "Undid" in answered[0]["text"] or "↩️" in answered[0]["text"]
-        assert answered[0]["callback_query_id"] == "cqid_success"
+        assert len(channel._app.bot.answered_callbacks) == 0
 
     @pytest.mark.asyncio
     async def test_confirm_pops_turn_stack(self):
@@ -1658,8 +1654,8 @@ class TestTelegramUndoConfirmationUI:
         assert stack[0]["user_msg_id"] == 1
 
     @pytest.mark.asyncio
-    async def test_confirm_stores_callback_query_id_no_immediate_answer(self):
-        """_handle_undo_confirm stores query.id in pending state without calling query.answer()."""
+    async def test_confirm_answers_callback_immediately(self):
+        """_handle_undo_confirm answers the callback immediately (no deferred answering)."""
         channel = _make_telegram_channel()
         skey = "telegram:123"
         channel._session_turn_stack[skey] = [{"user_msg_id": 5, "bot_msg_ids": [50]}]
@@ -1677,14 +1673,14 @@ class TestTelegramUndoConfirmationUI:
         }
 
         channel._handle_message = AsyncMock()
-        fake_query = SimpleNamespace(data=f"undo_confirm:{skey}", id="cqid_deferred", answer=AsyncMock())
+        fake_query = SimpleNamespace(data=f"undo_confirm:{skey}", id="cqid_immediate", answer=AsyncMock())
         await channel._handle_undo_confirm(fake_query, skey)
 
-        # query.answer() must NOT be called yet — the callback is answered by _handle_undo_result
-        fake_query.answer.assert_not_called()
+        # query.answer() MUST be called immediately — no deferred callback answering
+        fake_query.answer.assert_called_once()
 
-        # The callback_query_id is stored in the pending state for deferred answering
-        assert channel._pending_undo[skey].get("callback_query_id") == "cqid_deferred"
+        # callback_query_id must NOT be stored — we no longer defer answering
+        assert "callback_query_id" not in channel._pending_undo.get(skey, {})
 
         # No chat bubble sent
         assert len(channel._app.bot.sent_messages) == 0
@@ -1878,7 +1874,7 @@ class TestTelegramUndoConfirmationUI:
 
     @pytest.mark.asyncio
     async def test_no_chat_bubble_after_confirm(self):
-        """After full two-phase confirm, NO chat bubble is sent — feedback is via answerCallbackQuery."""
+        """After full two-phase confirm, NO chat bubble is sent and NO answerCallbackQuery — result conveyed via message deletion."""
         channel = _make_telegram_channel()
         skey = "telegram:123"
         channel._session_turn_stack[skey] = [{"user_msg_id": 5, "bot_msg_ids": [50]}]
@@ -1899,7 +1895,9 @@ class TestTelegramUndoConfirmationUI:
         fake_query = SimpleNamespace(data=f"undo_confirm:{skey}", id="cqid_nobubble", answer=AsyncMock())
         await channel._handle_undo_confirm(fake_query, skey)
 
-        # No chat messages yet from _handle_undo_confirm
+        # query.answer() called immediately by _handle_undo_confirm
+        fake_query.answer.assert_called_once()
+        # No chat messages from _handle_undo_confirm
         assert len(channel._app.bot.sent_messages) == 0
 
         # Simulate backend returning structured success result
@@ -1911,11 +1909,9 @@ class TestTelegramUndoConfirmationUI:
             },
         ))
 
-        # Still NO chat bubble — feedback via answerCallbackQuery only
+        # Still NO chat bubble and no answerCallbackQuery after result
         assert len(channel._app.bot.sent_messages) == 0
-        answered = channel._app.bot.answered_callbacks
-        assert len(answered) == 1
-        assert "Undid" in answered[0]["text"] or "↩️" in answered[0]["text"]
+        assert len(channel._app.bot.answered_callbacks) == 0
 
     # ---- Consecutive undos remain UI-consistent ----
 
@@ -2196,8 +2192,8 @@ class TestTelegramUndoConfirmationUI:
         assert len(stack) == 1
 
     @pytest.mark.asyncio
-    async def test_handle_undo_result_expired_uses_callback_answer_not_chat_bubble(self):
-        """send() with _undo_result status=expired uses answerCallbackQuery, not send_message."""
+    async def test_handle_undo_result_expired_no_chat_bubble_no_callback_answer(self):
+        """send() with _undo_result status=expired sends no chat bubble and no answerCallbackQuery."""
         channel = _make_telegram_channel()
         skey = "telegram:123"
         channel._pending_undo[skey] = {
@@ -2206,7 +2202,6 @@ class TestTelegramUndoConfirmationUI:
             "user_msg_id": None,
             "bot_msg_ids": [],
             "message_thread_id": None,
-            "callback_query_id": "cqid_expired",
         }
 
         await channel.send(OutboundMessage(
@@ -2217,17 +2212,13 @@ class TestTelegramUndoConfirmationUI:
             },
         ))
 
-        # No chat bubble
+        # No chat bubble and no answerCallbackQuery — confirmation message is deleted
         assert len(channel._app.bot.sent_messages) == 0
-        # Feedback via answerCallbackQuery
-        answered = channel._app.bot.answered_callbacks
-        assert len(answered) == 1
-        assert "expired" in answered[0]["text"].lower() or "⚠️" in answered[0]["text"]
-        assert answered[0]["callback_query_id"] == "cqid_expired"
+        assert len(channel._app.bot.answered_callbacks) == 0
 
     @pytest.mark.asyncio
-    async def test_handle_undo_result_nothing_uses_callback_answer_and_clears_pending(self):
-        """send() with _undo_result status=nothing uses answerCallbackQuery and clears pending."""
+    async def test_handle_undo_result_nothing_no_chat_bubble_and_clears_pending(self):
+        """send() with _undo_result status=nothing sends no chat bubble and clears pending."""
         channel = _make_telegram_channel()
         skey = "telegram:123"
         channel._pending_undo[skey] = {
@@ -2236,7 +2227,6 @@ class TestTelegramUndoConfirmationUI:
             "user_msg_id": None,
             "bot_msg_ids": [],
             "message_thread_id": None,
-            "callback_query_id": "cqid_nothing",
         }
 
         await channel.send(OutboundMessage(
@@ -2247,13 +2237,9 @@ class TestTelegramUndoConfirmationUI:
             },
         ))
 
-        # No chat bubble
+        # No chat bubble and no answerCallbackQuery
         assert len(channel._app.bot.sent_messages) == 0
-        # Feedback via answerCallbackQuery
-        answered = channel._app.bot.answered_callbacks
-        assert len(answered) == 1
-        assert "nothing" in answered[0]["text"].lower()
-        assert answered[0]["callback_query_id"] == "cqid_nothing"
+        assert len(channel._app.bot.answered_callbacks) == 0
         # Pending state cleared
         assert skey not in channel._pending_undo
 
