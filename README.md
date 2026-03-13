@@ -20,6 +20,7 @@
 
 ## 📢 News
 
+- **2026-03-13** 🔀 `/model` hot-switching, `/undo` with file-rollback, and per-subagent model selection are now fully documented — see [Model Hot-Switching](#model-hot-switching) and the [Telegram commands table](#-chat-apps).
 - **2026-03-08** 🚀 Released **v0.1.4.post4** — a reliability-packed release with safer defaults, better multi-instance support, sturdier MCP, and major channel and provider improvements. Please see [release notes](https://github.com/HKUDS/nanobot/releases/tag/v0.1.4.post4) for details.
 - **2026-03-07** 🚀 Azure OpenAI provider, WhatsApp media, QQ group chats, and more Telegram/Feishu polish.
 - **2026-03-06** 🪄 Lighter providers, smarter media handling, and sturdier memory and CLI compatibility.
@@ -242,6 +243,21 @@ Connect nanobot to your favorite chat platform.
 ```bash
 nanobot gateway
 ```
+
+**4. Available bot commands**
+
+Once running, send these commands directly in Telegram:
+
+| Command | Description |
+|---------|-------------|
+| `/new` | Start a new conversation (clears history) |
+| `/undo` | Undo the last turn (removes last exchange and reverts file changes) |
+| `/model` | Show an inline keyboard to switch AI models on the fly |
+| `/model <name>` | Switch to a specific model immediately (e.g. `/model openai/gpt-4o`) |
+| `/stop` | Cancel the running task |
+| `/help` | List all available commands |
+
+> **Tip:** `/model` requires `candidateModels` to be set in your config. See [Model Hot-Switching](#model-hot-switching) below.
 
 </details>
 
@@ -873,6 +889,50 @@ That's it! Environment variables, model prefixing, config matching, and `nanobot
 | `strip_model_prefix` | Strip existing prefix before re-prefixing | `True` (for AiHubMix) |
 
 </details>
+
+
+### Model Hot-Switching
+
+Switch AI models **per-session at runtime** — no restart required. The active model is tracked per session and never written to session history.
+
+**1. Configure candidate models** in `~/.nanobot/config.json`:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": "anthropic/claude-opus-4-5",
+      "candidateModels": [
+        "anthropic/claude-opus-4-5",
+        "openai/gpt-4o",
+        "deepseek/deepseek-chat"
+      ]
+    }
+  }
+}
+```
+
+> Include your default model in `candidateModels` so you can always switch back to it from the keyboard.
+
+**2. Switch at runtime:**
+
+- **Telegram**: Send `/model` to see an inline keyboard listing every candidate.  
+  The header shows your current model (e.g. `Current: anthropic/claude-opus-4-5`). Tap a button to switch instantly.  
+  Or type `/model <name>` (e.g. `/model openai/gpt-4o`) to switch directly without the keyboard.
+- **CLI**: Type `/model` to list all candidates with the current model highlighted.  
+  Type `/model <name>` to switch immediately.
+
+> `candidateModels` is optional. Without it, `/model` still shows the current model name but no switching keyboard is displayed.
+
+**Per-subagent model selection**
+
+When the agent spawns background subagents, you can instruct it to use a specific model for a particular subtask:
+
+```
+spawn(task="deep analysis", model="openai/gpt-4o")
+```
+
+The `model` argument is optional — it defaults to the current session model when omitted. This lets you mix models within a single conversation (e.g. a cheaper model for quick summarisation and a more capable one for reasoning-heavy subtasks).
 
 
 ### MCP (Model Context Protocol)
