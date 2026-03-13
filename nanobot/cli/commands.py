@@ -205,6 +205,15 @@ def onboard():
     console.print("  1. Add your API key to [cyan]~/.nanobot/config.json[/cyan]")
     console.print("     Get one at: https://openrouter.ai/keys")
     console.print("  2. Chat: [cyan]nanobot agent -m \"Hello!\"[/cyan]")
+    console.print("\n[bold]Telegram bot commands:[/bold]")
+    console.print("  /new    — Start a new conversation")
+    console.print("  /undo   — Undo the last turn (reverts file changes too)")
+    console.print("  /model  — Switch AI model on the fly")
+    console.print("  /stop   — Stop the current task")
+    console.print("  /help   — List all commands")
+    console.print("\n[bold]Tip — model hot-switching:[/bold]")
+    console.print("  Your config already includes [cyan]candidateModels[/cyan] with example models.")
+    console.print("  Edit them in [cyan]~/.nanobot/config.json[/cyan] then use /model in Telegram to switch.")
     console.print("\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]")
 
 
