@@ -177,7 +177,12 @@ Here is a **minimal working config** — copy it to `~/.nanobot/config.json` and
   "agents": {
     "defaults": {
       "model": "anthropic/claude-opus-4-5",
-      "provider": "openrouter"
+      "provider": "openrouter",
+      "candidateModels": [
+        "anthropic/claude-opus-4-5",
+        "openai/gpt-4o",
+        "deepseek/deepseek-chat"
+      ]
     }
   }
 }

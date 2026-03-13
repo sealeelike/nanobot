@@ -62,7 +62,7 @@ class TestModelCommand:
 
     @pytest.mark.asyncio
     async def test_model_list_falls_back_to_default_model_when_no_candidates(self):
-        """'/model' with no candidates lists the current default model."""
+        """'/model' with no candidates returns the current model and a config snippet."""
         loop, bus = _make_loop(candidate_models=[])
         msg = InboundMessage(
             channel="cli", sender_id="u1", chat_id="c1", content="/model"
@@ -71,6 +71,9 @@ class TestModelCommand:
 
         assert response is not None
         assert "default-model" in response.content
+        # Should include a config hint explaining how to set up candidateModels
+        assert "candidateModels" in response.content
+        assert "```json" in response.content
 
     @pytest.mark.asyncio
     async def test_model_switch_updates_session_model(self):

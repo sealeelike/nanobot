@@ -686,10 +686,36 @@ class AgentLoop:
         if cmd == "/model" or cmd.startswith("/model "):
             parts = content_raw.split(None, 1)
             if len(parts) == 1:
-                # List candidate models
-                models = self.candidate_models or [self.model]
-                model_list = "\n".join(models)
                 current = self._session_models.get(key, self.model)
+                if not self.candidate_models:
+                    # No candidates configured — return a concrete setup hint.
+                    config_hint = (
+                        "{\n"
+                        '  "agents": {\n'
+                        '    "defaults": {\n'
+                        f'      "model": "{current}",\n'
+                        '      "candidateModels": [\n'
+                        f'        "{current}",\n'
+                        '        "openai/gpt-4o",\n'
+                        '        "deepseek/deepseek-chat"\n'
+                        "      ]\n"
+                        "    }\n"
+                        "  }\n"
+                        "}"
+                    )
+                    return OutboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id,
+                        content=(
+                            f"Current model: `{current}`\n\n"
+                            "No candidate models configured. "
+                            "To enable `/model` hot-switching, add `candidateModels` to "
+                            "`~/.nanobot/config.json`:\n"
+                            f"```json\n{config_hint}\n```"
+                        ),
+                        metadata=dict(msg.metadata or {}),
+                    )
+                # List candidate models
+                model_list = "\n".join(self.candidate_models)
                 return OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
                     content=f"Current model: `{current}`\n\nAvailable models:\n```\n{model_list}\n```\nUse `/model <name>` to switch.",
