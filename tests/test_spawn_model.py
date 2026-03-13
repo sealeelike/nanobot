@@ -12,11 +12,11 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.bus.queue import MessageBus
 
 
-def _make_manager(default_model: str = "default-model") -> SubagentManager:
+def _make_manager(default_model: str = "default-model", candidate_models: list[str] | None = None) -> SubagentManager:
     provider = MagicMock()
     provider.get_default_model.return_value = default_model
     bus = MessageBus()
-    return SubagentManager(provider=provider, workspace=MagicMock(), bus=bus)
+    return SubagentManager(provider=provider, workspace=MagicMock(), bus=bus, candidate_models=candidate_models)
 
 
 class TestSpawnToolSchema:
@@ -36,6 +36,22 @@ class TestSpawnToolSchema:
         tool = SpawnTool(mgr)
         desc = tool.parameters["properties"]["model"]["description"].lower()
         assert "default" in desc
+
+    def test_model_description_lists_candidates_when_configured(self):
+        """SpawnTool 'model' description lists available models when candidates are set."""
+        candidates = ["anthropic/claude-opus-4-5", "openai/gpt-4o"]
+        mgr = _make_manager(candidate_models=candidates)
+        tool = SpawnTool(mgr)
+        desc = tool.parameters["properties"]["model"]["description"]
+        for model in candidates:
+            assert model in desc
+
+    def test_model_description_no_candidates_when_empty(self):
+        """SpawnTool 'model' description omits candidate list when none are configured."""
+        mgr = _make_manager(candidate_models=[])
+        tool = SpawnTool(mgr)
+        desc = tool.parameters["properties"]["model"]["description"]
+        assert "Available models" not in desc
 
 
 class TestSpawnToolExecute:

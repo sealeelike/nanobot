@@ -37,6 +37,14 @@ class SpawnTool(Tool):
 
     @property
     def parameters(self) -> dict[str, Any]:
+        candidate_models = self._manager.candidate_models
+        if candidate_models:
+            model_desc = (
+                "Optional model for the subagent to use. Defaults to the current model if omitted. "
+                f"Available models: {', '.join(candidate_models)}."
+            )
+        else:
+            model_desc = "Optional model for the subagent to use. Defaults to the current model if omitted."
         return {
             "type": "object",
             "properties": {
@@ -50,7 +58,7 @@ class SpawnTool(Tool):
                 },
                 "model": {
                     "type": "string",
-                    "description": "Optional model for the subagent to use. Defaults to the current model if omitted.",
+                    "description": model_desc,
                 },
             },
             "required": ["task"],

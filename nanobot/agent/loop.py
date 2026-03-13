@@ -8,7 +8,7 @@ import re
 import weakref
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from loguru import logger
 
@@ -96,6 +96,7 @@ class AgentLoop:
             workspace=workspace,
             bus=bus,
             model=self.model,
+            candidate_models=self.candidate_models,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             reasoning_effort=reasoning_effort,
