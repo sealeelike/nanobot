@@ -208,13 +208,12 @@ def onboard():
     console.print("\n[bold]Telegram bot commands:[/bold]")
     console.print("  /new    — Start a new conversation")
     console.print("  /undo   — Undo the last turn (reverts file changes too)")
-    console.print("  /model  — Switch AI model on the fly (requires candidateModels in config)")
+    console.print("  /model  — Switch AI model on the fly")
     console.print("  /stop   — Stop the current task")
     console.print("  /help   — List all commands")
     console.print("\n[bold]Tip — model hot-switching:[/bold]")
-    console.print("  Add [cyan]candidateModels[/cyan] to your config to enable /model in Telegram:")
-    console.print('  [dim]{ "agents": { "defaults": { "model": "anthropic/claude-opus-4-5",')
-    console.print('      "candidateModels": ["anthropic/claude-opus-4-5", "openai/gpt-4o"] } } }[/dim]')
+    console.print("  Your config already includes [cyan]candidateModels[/cyan] with example models.")
+    console.print("  Edit them in [cyan]~/.nanobot/config.json[/cyan] then use /model in Telegram to switch.")
     console.print("\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]")
 
 

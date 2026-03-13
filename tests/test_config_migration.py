@@ -157,3 +157,29 @@ def test_migrated_default_provider_loads_into_schema(tmp_path):
 
     config: Config = load_config(cfg_file)
     assert config.agents.defaults.provider == "openrouter"
+
+
+# ---------------------------------------------------------------------------
+# candidateModels default
+# ---------------------------------------------------------------------------
+
+
+def test_default_config_has_non_empty_candidate_models():
+    """Fresh Config() must include example candidate models, not an empty list."""
+    config = Config()
+    assert config.agents.defaults.candidate_models, (
+        "AgentDefaults.candidate_models must not be empty — "
+        "onboard-generated configs should surface the /model hot-switching feature"
+    )
+    assert "anthropic/claude-opus-4-5" in config.agents.defaults.candidate_models
+
+
+def test_candidate_models_preserved_when_user_sets_empty_list(tmp_path):
+    """If a user explicitly sets candidateModels: [] in their config, that choice is preserved."""
+    import json
+
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps({"agents": {"defaults": {"candidateModels": []}}}))
+
+    config: Config = load_config(cfg_file)
+    assert config.agents.defaults.candidate_models == []

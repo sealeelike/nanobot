@@ -231,7 +231,13 @@ class AgentDefaults(Base):
     max_tool_iterations: int = 40
     memory_window: int = 100
     reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
-    candidate_models: list[str] = Field(default_factory=list)  # Models available for /model hot-switching
+    candidate_models: list[str] = Field(  # Models available for /model hot-switching
+        default_factory=lambda: [
+            "anthropic/claude-opus-4-5",
+            "openai/gpt-4o",
+            "deepseek/deepseek-chat",
+        ]
+    )
 
 
 class AgentsConfig(Base):
