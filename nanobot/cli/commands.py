@@ -222,8 +222,8 @@ def onboard():
 
 def _make_provider(config: Config):
     """Create the appropriate LLM provider from config."""
-    from nanobot.providers.openai_codex_provider import OpenAICodexProvider
     from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
+    from nanobot.providers.openai_codex_provider import OpenAICodexProvider
 
     model = config.agents.defaults.model
     provider_name = config.get_provider_name(model)
@@ -281,7 +281,7 @@ def _make_provider(config: Config):
             console.print("Set them in ~/.nanobot/config.json under providers.azure_openai section")
             console.print("Use the model field to specify the deployment name.")
             raise typer.Exit(1)
-        
+
         return AzureOpenAIProvider(
             api_key=p.api_key,
             api_base=p.api_base,
@@ -358,6 +358,10 @@ def gateway(
     provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
 
+    # Load plugins from config.
+    from nanobot.plugins import load_plugins
+    plugins = load_plugins(config.agents.defaults.plugins)
+
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_cron_dir() / "jobs.json"
     cron = CronService(cron_store_path)
@@ -382,6 +386,7 @@ def gateway(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         candidate_models=config.agents.defaults.candidate_models,
+        plugins=plugins,
     )
 
     # Set cron callback (needs agent)
@@ -425,8 +430,8 @@ def gateway(
         return response
     cron.on_job = on_cron_job
 
-    # Create channel manager
-    channels = ChannelManager(config, bus)
+    # Create channel manager (pass plugins so Telegram channel can call setup_telegram()).
+    channels = ChannelManager(config, bus, plugins=plugins)
 
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""

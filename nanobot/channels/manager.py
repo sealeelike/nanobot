@@ -7,7 +7,6 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
@@ -23,11 +22,12 @@ class ChannelManager:
     - Route outbound messages
     """
 
-    def __init__(self, config: Config, bus: MessageBus):
+    def __init__(self, config: Config, bus: MessageBus, plugins: list | None = None):
         self.config = config
         self.bus = bus
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
+        self._plugins: list = list(plugins or [])
 
         self._init_channels()
 
@@ -44,6 +44,7 @@ class ChannelManager:
                     groq_api_key=self.config.providers.groq.api_key,
                     candidate_models=self.config.agents.defaults.candidate_models,
                     default_model=self.config.agents.defaults.model,
+                    plugins=self._plugins,
                 )
                 logger.info("Telegram channel enabled")
             except ImportError as e:

@@ -8,8 +8,22 @@ import time
 import unicodedata
 
 from loguru import logger
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyParameters, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    ReplyParameters,
+    Update,
+)
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from telegram.request import HTTPXRequest
 
 from nanobot.bus.events import OutboundMessage
@@ -173,6 +187,7 @@ class TelegramChannel(BaseChannel):
         groq_api_key: str = "",
         candidate_models: list[str] | None = None,
         default_model: str = "",
+        plugins: list | None = None,
     ):
         super().__init__(config, bus)
         self.config: TelegramConfig = config
@@ -194,6 +209,15 @@ class TelegramChannel(BaseChannel):
         #   confirmation_msg_id, message_thread_id, sender_id}
         self._pending_undo: dict[str, dict] = {}
 
+        # Plugin hooks — registered by NanobotPlugin.setup_telegram() during start().
+        # Outbound handlers: (predicate, async handler) — checked before built-in special-cases.
+        self._outbound_handlers: list[tuple] = []
+        # Inbound hooks: called with (chat_id, message_id, session_key) for each user message.
+        self._inbound_hooks: list = []
+        # Sent hooks: called with (chat_id, message_id, thread_id) for each persisted bot message.
+        self._sent_hooks: list = []
+        self._plugins: list = list(plugins or [])
+
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
         if super().is_allowed(sender_id):
@@ -212,6 +236,33 @@ class TelegramChannel(BaseChannel):
             return False
 
         return sid in allow_list or username in allow_list
+
+    # -----------------------------------------------------------------------
+    # Plugin API — registration methods for NanobotPlugin.setup_telegram()
+    # -----------------------------------------------------------------------
+
+    def register_outbound_handler(self, predicate, handler) -> None:
+        """Register a plugin outbound handler.
+
+        ``predicate`` receives an ``OutboundMessage``.  The first handler whose
+        predicate returns ``True`` is invoked, and the built-in special-case
+        processing is skipped for that message.
+        """
+        self._outbound_handlers.append((predicate, handler))
+
+    def register_inbound_hook(self, callback) -> None:
+        """Register a callback invoked for every incoming user message.
+
+        Called with ``(chat_id: str, message_id: int, session_key: str | None)``.
+        """
+        self._inbound_hooks.append(callback)
+
+    def register_sent_hook(self, callback) -> None:
+        """Register a callback invoked after each persisted (non-auto-delete) bot message.
+
+        Called with ``(chat_id: str, message_id: int, thread_id: int | None)``.
+        """
+        self._sent_hooks.append(callback)
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -233,7 +284,14 @@ class TelegramChannel(BaseChannel):
         self._app = builder.build()
         self._app.add_error_handler(self._on_error)
 
-        # Add command handlers
+        # Let plugins register their handlers FIRST so they take priority over built-ins.
+        for plugin in self._plugins:
+            try:
+                plugin.setup_telegram(self, self._app)
+            except Exception as e:
+                logger.error("Plugin {!r} setup_telegram error: {}", getattr(plugin, "name", plugin), e)
+
+        # Add built-in command handlers (used as fallback when no plugin handles the command).
         self._app.add_handler(CommandHandler("start", self._on_start))
         self._app.add_handler(CommandHandler("new", self._forward_command))
         self._app.add_handler(CommandHandler("undo", self._on_undo_command))
@@ -322,6 +380,16 @@ class TelegramChannel(BaseChannel):
         if msg.metadata.get("_suppress_tg_response"):
             return
 
+        # Check plugin outbound handlers first — they take priority over built-in special-cases.
+        for predicate, handler in self._outbound_handlers:
+            try:
+                if predicate(msg):
+                    await handler(msg)
+                    return
+            except Exception as e:
+                logger.error("Plugin outbound handler error: {}", e)
+                return
+
         # Handle undo plan response: show confirmation keyboard instead of a chat bubble.
         if "_undo_plan" in msg.metadata:
             await self._show_undo_confirmation(msg)
@@ -405,6 +473,12 @@ class TelegramChannel(BaseChannel):
                         stack = self._session_turn_stack.get(skey)
                         if stack:
                             stack[-1]["bot_msg_ids"].append(sent.message_id)
+                        # Notify plugin sent-hooks.
+                        for hook in self._sent_hooks:
+                            try:
+                                hook(msg.chat_id, sent.message_id, thread_id)
+                            except Exception as e:
+                                logger.error("Plugin sent-hook error: {}", e)
                 else:
                     await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
 
@@ -868,7 +942,6 @@ class TelegramChannel(BaseChannel):
         self._remember_thread_context(message)
         chat_id = str(message.chat_id)
         session_key = self._derive_topic_session_key(message)
-        skey = session_key or f"telegram:{chat_id}"
 
         # Delete the /undo command message itself (always safe).
         try:
@@ -1031,6 +1104,13 @@ class TelegramChannel(BaseChannel):
         if skey not in self._session_turn_stack:
             self._session_turn_stack[skey] = []
         self._session_turn_stack[skey].append({"user_msg_id": message.message_id, "bot_msg_ids": []})
+
+        # Notify plugin inbound hooks.
+        for hook in self._inbound_hooks:
+            try:
+                hook(str_chat_id, message.message_id, session_key)
+            except Exception as e:
+                logger.error("Plugin inbound-hook error: {}", e)
 
         # Telegram media groups: buffer briefly, forward as one aggregated turn.
         if media_group_id := getattr(message, "media_group_id", None):

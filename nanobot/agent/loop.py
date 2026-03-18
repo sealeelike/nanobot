@@ -8,7 +8,7 @@ import re
 import weakref
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from loguru import logger
 
@@ -30,6 +30,7 @@ from nanobot.session.manager import Session, SessionManager
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig
     from nanobot.cron.service import CronService
+    from nanobot.plugins.base import NanobotPlugin
 
 
 class AgentLoop:
@@ -69,6 +70,7 @@ class AgentLoop:
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
         candidate_models: list[str] | None = None,
+        plugins: list[NanobotPlugin] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
@@ -116,7 +118,14 @@ class AgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._session_models: dict[str, str] = {}  # Per-session model overrides
         self._processing_lock = asyncio.Lock()
+        # Plugin command handlers: list of (predicate, async handler) pairs.
+        # Checked in order before the built-in /undo, /model dispatch in run().
+        self._command_handlers: list[tuple[Callable[[InboundMessage], bool], Callable]] = []
         self._register_default_tools()
+
+        # Initialise plugins last so they can call register_command_handler().
+        for plugin in (plugins or []):
+            plugin.setup_agent(self)
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -135,6 +144,46 @@ class AgentLoop:
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+
+    # -----------------------------------------------------------------------
+    # Plugin API — public helpers for use by NanobotPlugin subclasses
+    # -----------------------------------------------------------------------
+
+    def register_command_handler(
+        self,
+        predicate: Callable[[InboundMessage], bool],
+        handler: Callable[[InboundMessage], Awaitable[None]],
+    ) -> None:
+        """Register a plugin command handler.
+
+        ``predicate`` is called with the incoming message.  The first handler
+        whose predicate returns ``True`` is invoked; subsequent handlers and
+        the built-in dispatch are skipped.  Handlers are checked in registration
+        order, so more specific predicates should be registered before generic ones.
+        """
+        self._command_handlers.append((predicate, handler))
+
+    def set_session_model(self, session_key: str, model: str) -> None:
+        """Override the LLM model used for *session_key*."""
+        self._session_models[session_key] = model
+        logger.info("Session {} switched to model: {}", session_key, model)
+
+    def get_session_model(self, session_key: str) -> str:
+        """Return the active model for *session_key* (falls back to default)."""
+        return self._session_models.get(session_key, self.model)
+
+    async def cancel_session_tasks(self, session_key: str) -> None:
+        """Cancel all active agent tasks and subagents for *session_key*."""
+        tasks = self._active_tasks.pop(session_key, [])
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        await self.subagents.cancel_by_session(session_key)
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -274,6 +323,21 @@ class AgentLoop:
             try:
                 msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
             except asyncio.TimeoutError:
+                continue
+
+            # Check plugin command handlers first (registered handlers take priority).
+            handled = False
+            for predicate, handler in self._command_handlers:
+                try:
+                    if predicate(msg):
+                        await handler(msg)
+                        handled = True
+                        break
+                except Exception as e:
+                    logger.error("Plugin command handler error: {}", e)
+                    handled = True
+                    break
+            if handled:
                 continue
 
             if msg.content.strip().lower() == "/stop":

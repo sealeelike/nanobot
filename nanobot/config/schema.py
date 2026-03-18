@@ -238,6 +238,9 @@ class AgentDefaults(Base):
             "deepseek/deepseek-chat",
         ]
     )
+    plugins: list[str] = Field(  # Dotted class paths for NanobotPlugin subclasses to load
+        default_factory=list
+    )
 
 
 class AgentsConfig(Base):
