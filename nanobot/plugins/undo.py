@@ -38,7 +38,11 @@ if TYPE_CHECKING:
     from nanobot.agent.loop import AgentLoop
     from nanobot.channels.telegram import TelegramChannel
 
-# Tools whose side effects are fully reversible by restoring file content.
+# Tools that must NOT be flagged as "non-reversible" in the undo preview dialog.
+# write_file and edit_file are listed because their changes can be rolled back
+# by restoring the previous file content.  read_file and list_dir produce no
+# side effects and are therefore transparent (they should also not appear in
+# the "non-reversible" warning).
 _REVERSIBLE_TOOLS: frozenset[str] = frozenset({"write_file", "edit_file", "read_file", "list_dir"})
 
 
